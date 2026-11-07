@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,11 +13,16 @@ import (
 	"strings"
 	"time"
 
+	swaggerui "github.com/swaggest/swgui/v5emb"
+
 	"photo-server/internal/photo"
 )
 
 const maxEncodedPhotoPath = 5464
 const maxFeedbackBodyBytes = 4096
+
+//go:embed openapi.json
+var openAPISpec []byte
 
 type handler struct {
 	service *photo.Service
@@ -56,6 +62,9 @@ func NewHandler(service *photo.Service, logger *slog.Logger) http.Handler {
 	}
 	h := &handler{service: service, logger: logger}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /docs", h.docsRedirect)
+	mux.HandleFunc("GET /docs/openapi.json", h.openAPI)
+	mux.Handle("GET /docs/", swaggerui.New("Photo Server API", "/docs/openapi.json", "/docs/"))
 	mux.HandleFunc("GET /api/photos/next", h.next)
 	mux.HandleFunc("GET /api/photos/history", h.history)
 	mux.HandleFunc("GET /api/photos/{id}/image", h.image)
@@ -64,6 +73,17 @@ func NewHandler(service *photo.Service, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /api/photos/{id}/faulty-tag", h.faultyTag)
 	mux.HandleFunc("/", h.notFound)
 	return mux
+}
+
+func (h *handler) docsRedirect(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/docs/", http.StatusMovedPermanently)
+}
+
+func (h *handler) openAPI(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(openAPISpec)
 }
 
 func (h *handler) next(w http.ResponseWriter, r *http.Request) {
@@ -208,6 +228,11 @@ func decodeFeedbackBody(w http.ResponseWriter, r *http.Request, value any) error
 }
 
 func (h *handler) notFound(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/docs" || strings.HasPrefix(r.URL.Path, "/docs/") {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	if r.URL.Path == "/api/photos/next" || r.URL.Path == "/api/photos/history" ||
 		(strings.HasPrefix(r.URL.Path, "/api/photos/") && (strings.HasSuffix(r.URL.Path, "/image") ||
 			strings.HasSuffix(r.URL.Path, "/reject") || strings.HasSuffix(r.URL.Path, "/rating") || strings.HasSuffix(r.URL.Path, "/faulty-tag"))) {
