@@ -1,4 +1,4 @@
-// Package httpapi exposes photo selection, image delivery, and history over HTTP.
+// Package httpapi exposes photo selection, image delivery, history, and feedback over HTTP.
 package httpapi
 
 import (
@@ -16,6 +16,7 @@ import (
 )
 
 const maxEncodedPhotoPath = 5464
+const maxFeedbackBodyBytes = 4096
 
 type handler struct {
 	service *photo.Service
@@ -40,6 +41,14 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type ratingRequest struct {
+	Rating int `json:"rating"`
+}
+
+type faultyTagRequest struct {
+	Tag string `json:"tag"`
+}
+
 // NewHandler creates the HTTP routes used by slideshow clients.
 func NewHandler(service *photo.Service, logger *slog.Logger) http.Handler {
 	if logger == nil {
@@ -50,6 +59,9 @@ func NewHandler(service *photo.Service, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /api/photos/next", h.next)
 	mux.HandleFunc("GET /api/photos/history", h.history)
 	mux.HandleFunc("GET /api/photos/{id}/image", h.image)
+	mux.HandleFunc("POST /api/photos/{id}/reject", h.reject)
+	mux.HandleFunc("POST /api/photos/{id}/rating", h.rate)
+	mux.HandleFunc("POST /api/photos/{id}/faulty-tag", h.faultyTag)
 	mux.HandleFunc("/", h.notFound)
 	return mux
 }
@@ -93,17 +105,12 @@ func (h *handler) history(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *handler) image(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" || len(id) > maxEncodedPhotoPath {
+	relativePath, ok := decodePhotoID(r.PathValue("id"))
+	if !ok {
 		writeError(w, http.StatusNotFound, "photo not found")
 		return
 	}
-	relativePath, err := base64.RawURLEncoding.Strict().DecodeString(id)
-	if err != nil || len(relativePath) == 0 || len(relativePath) > 4096 || base64.RawURLEncoding.EncodeToString(relativePath) != id {
-		writeError(w, http.StatusNotFound, "photo not found")
-		return
-	}
-	image, err := h.service.OpenImage(r.Context(), string(relativePath))
+	image, err := h.service.OpenImage(r.Context(), relativePath)
 	if err != nil {
 		if errors.Is(err, photo.ErrPhotoNotFound) {
 			writeError(w, http.StatusNotFound, "photo not found")
@@ -120,13 +127,91 @@ func (h *handler) image(w http.ResponseWriter, r *http.Request) {
 	}()
 	w.Header().Set("Content-Type", image.ContentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	http.ServeContent(w, r, path.Base(string(relativePath)), image.ModTime, image.Content)
+	http.ServeContent(w, r, path.Base(relativePath), image.ModTime, image.Content)
+}
+
+func (h *handler) reject(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxFeedbackBodyBytes))
+	if err != nil || len(body) != 0 {
+		writeError(w, http.StatusBadRequest, "reject request must not contain a body")
+		return
+	}
+	h.recordFeedback(w, r, photo.Feedback{Type: photo.FeedbackReject})
+}
+
+func (h *handler) rate(w http.ResponseWriter, r *http.Request) {
+	var request ratingRequest
+	if err := decodeFeedbackBody(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid rating request")
+		return
+	}
+	h.recordFeedback(w, r, photo.Feedback{Type: photo.FeedbackRating, Rating: request.Rating})
+}
+
+func (h *handler) faultyTag(w http.ResponseWriter, r *http.Request) {
+	var request faultyTagRequest
+	if err := decodeFeedbackBody(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid faulty-tag request")
+		return
+	}
+	h.recordFeedback(w, r, photo.Feedback{Type: photo.FeedbackFaultyTag, Tag: request.Tag})
+}
+
+func (h *handler) recordFeedback(w http.ResponseWriter, r *http.Request, feedback photo.Feedback) {
+	relativePath, ok := decodePhotoID(r.PathValue("id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "photo not found")
+		return
+	}
+	if err := h.service.RecordFeedback(relativePath, feedback); err != nil {
+		switch {
+		case errors.Is(err, photo.ErrInvalidFeedback):
+			writeError(w, http.StatusBadRequest, "invalid photo feedback")
+		case errors.Is(err, photo.ErrPhotoNotInHistory):
+			writeError(w, http.StatusNotFound, "photo was not shown recently")
+		case errors.Is(err, photo.ErrFeedbackRecorderUnavailable):
+			writeError(w, http.StatusServiceUnavailable, "feedback recording unavailable")
+		default:
+			h.logger.Error("record photo feedback", "error", err)
+			writeError(w, http.StatusInternalServerError, "photo feedback failed")
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func decodePhotoID(id string) (string, bool) {
+	if id == "" || len(id) > maxEncodedPhotoPath {
+		return "", false
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(id)
+	if err != nil || len(decoded) == 0 || len(decoded) > 4096 || base64.RawURLEncoding.EncodeToString(decoded) != id {
+		return "", false
+	}
+	return string(decoded), true
+}
+
+func decodeFeedbackBody(w http.ResponseWriter, r *http.Request, value any) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxFeedbackBodyBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }
 
 func (h *handler) notFound(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/api/photos/next" || r.URL.Path == "/api/photos/history" ||
-		(strings.HasPrefix(r.URL.Path, "/api/photos/") && strings.HasSuffix(r.URL.Path, "/image")) {
-		w.Header().Set("Allow", "GET, HEAD")
+		(strings.HasPrefix(r.URL.Path, "/api/photos/") && (strings.HasSuffix(r.URL.Path, "/image") ||
+			strings.HasSuffix(r.URL.Path, "/reject") || strings.HasSuffix(r.URL.Path, "/rating") || strings.HasSuffix(r.URL.Path, "/faulty-tag"))) {
+		w.Header().Set("Allow", "GET, HEAD, POST")
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}

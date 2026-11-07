@@ -16,10 +16,13 @@ import (
 )
 
 type selectionEvent struct {
-	Path     string         `json:"path"`
-	Album    string         `json:"album,omitempty"`
-	Metadata photo.Metadata `json:"metadata"`
-	ShownAt  time.Time      `json:"shown_at"`
+	Path     string             `json:"path"`
+	Album    string             `json:"album,omitempty"`
+	Metadata photo.Metadata     `json:"metadata"`
+	ShownAt  time.Time          `json:"shown_at"`
+	Type     photo.FeedbackType `json:"type,omitempty"`
+	Rating   int                `json:"rating,omitempty"`
+	Tag      string             `json:"tag,omitempty"`
 }
 
 func TestLogAppendAcrossReopen(t *testing.T) {
@@ -55,6 +58,60 @@ func TestLogAppendAcrossReopen(t *testing.T) {
 	}
 	assertEvent(t, events[0], first)
 	assertEvent(t, events[1], second)
+}
+
+func TestLogRecordsTypedFeedbackEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	log, err := eventlog.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shownAt := time.Date(2026, 11, 7, 15, 2, 0, 0, time.UTC)
+	selection := testEntry("album/photo.jpg", shownAt)
+	if err := log.Record(selection); err != nil {
+		t.Fatal(err)
+	}
+	feedback := []photo.FeedbackEvent{
+		{Type: photo.FeedbackReject, Path: selection.Photo.Path, ShownAt: shownAt},
+		{Type: photo.FeedbackRating, Path: selection.Photo.Path, ShownAt: shownAt, Rating: 4},
+		{Type: photo.FeedbackFaultyTag, Path: selection.Photo.Path, ShownAt: shownAt, Tag: "incorrect location"},
+	}
+	for _, event := range feedback {
+		if err := log.RecordFeedback(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	events := readEvents(t, path)
+	if len(events) != len(feedback)+1 {
+		t.Fatalf("event count = %d, want %d", len(events), len(feedback)+1)
+	}
+	if events[0].Type != "" || events[0].Path != selection.Photo.Path || !events[0].ShownAt.Equal(shownAt) {
+		t.Fatalf("selection event = %#v, want unchanged selection fields", events[0])
+	}
+	for index, want := range feedback {
+		got := events[index+1]
+		if got.Type != want.Type || got.Path != want.Path || !got.ShownAt.Equal(want.ShownAt) ||
+			got.Rating != want.Rating || got.Tag != want.Tag {
+			t.Errorf("feedback event %d = %#v, want %#v", index, got, want)
+		}
+	}
+
+	fileContents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first map[string]json.RawMessage
+	firstLine := strings.SplitN(string(fileContents), "\n", 2)[0]
+	if err := json.Unmarshal([]byte(firstLine), &first); err != nil {
+		t.Fatalf("decode first event: %v", err)
+	}
+	if _, hasType := first["type"]; hasType {
+		t.Fatal("selection event unexpectedly contains a feedback type")
+	}
 }
 
 func TestLogRecoversIncompleteTrailingLine(t *testing.T) {

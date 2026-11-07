@@ -67,7 +67,27 @@ Streams the selected image bytes. The `id` is opaque and is supplied in `image_u
 
 Returns up to ten successful selections, newest first. Each history entry includes the relative disk path, album (when applicable), available metadata, image URL, and `shown_at`: the UTC RFC 3339 timestamp recorded for that selection. `shown_at` describes when the service selected the photo; it is distinct from EXIF `captured_at`, which describes when the image was taken and may have no timezone. History is held in memory and resets when the process restarts. Delivering an image does not add another history entry.
 
-Each successful selection is also appended to the event log as one newline-delimited JSON object containing `path`, optional `album`, `metadata`, and `shown_at`. The append-only log survives restarts; it is separate from the bounded in-memory history, and only one server process should write to a given log file. On startup, an incomplete trailing line is truncated so later events remain valid JSON Lines. If the event cannot be saved, the selection request fails and is not added to in-memory history.
+### Feedback endpoints
+
+Send feedback using the opaque ID from a photo's `image_url` or a history entry's `image_url`:
+
+| Endpoint | Request body | Description |
+| --- | --- | --- |
+| `POST /api/photos/{id}/reject` | Empty | Rejects the shown photo. |
+| `POST /api/photos/{id}/rating` | `{"rating": 1}` through `{"rating": 5}` | Rates the photo from one to five. |
+| `POST /api/photos/{id}/faulty-tag` | `{"tag": "incorrect location"}` | Reports a faulty EXIF tag by name. |
+
+The ID must refer to a photo in the ten most recent successful selections. If the same photo was selected more than once, feedback is associated with its newest selection. A successful request returns `204 No Content`; malformed feedback returns `400`, and an unknown or no-longer-recent ID returns `404`. The service returns `503` if feedback cannot be durably recorded.
+
+Each successful selection is appended to the event log as one newline-delimited JSON object containing `path`, optional `album`, `metadata`, and `shown_at`. Feedback is appended to the same log with an event `type`, `path`, and the matching selection's `shown_at`; rating events also include `rating`, and faulty-tag events include `tag`. For example:
+
+```json
+{"type":"reject","path":"trips/coast/photo.jpg","shown_at":"2026-11-07T15:02:00Z"}
+{"type":"rating","path":"trips/coast/photo.jpg","shown_at":"2026-11-07T15:02:00Z","rating":4}
+{"type":"faulty_tag","path":"trips/coast/photo.jpg","shown_at":"2026-11-07T15:02:00Z","tag":"incorrect location"}
+```
+
+The append-only log survives restarts; it is separate from the bounded in-memory history, and only one server process should write to a given log file. On startup, an incomplete trailing line is truncated so later events remain valid JSON Lines. If a selection or feedback event cannot be saved, the request fails and the corresponding operation is not reported as successful.
 
 ## Photos and metadata
 
@@ -80,7 +100,7 @@ EXIF tags are returned when present and parseable. Capture time and GPS coordina
 | Environment variable | Default | Description |
 | --- | --- | --- |
 | `PHOTO_DIR` | `./photos` | Root directory containing image files and album directories. |
-| `EVENT_LOG` | `./events.jsonl` | File receiving append-only JSON Lines selection events. Its parent directory must exist. |
+| `EVENT_LOG` | `./events.jsonl` | File receiving append-only JSON Lines selection and feedback events. Its parent directory must exist. |
 | `HTTP_ADDR` | `127.0.0.1:8080` | TCP address for the HTTP server. |
 
 ## Tests
