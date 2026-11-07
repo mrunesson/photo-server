@@ -22,6 +22,12 @@ var (
 	ErrInvalidAlbum = errors.New("invalid album")
 	// ErrPhotoNotFound reports that a requested image is no longer in the photo catalog.
 	ErrPhotoNotFound = errors.New("photo not found")
+	// ErrPhotoNotInHistory reports that feedback targets a photo not shown recently.
+	ErrPhotoNotInHistory = errors.New("photo not found in recent history")
+	// ErrInvalidFeedback reports that feedback fields are invalid or inconsistent.
+	ErrInvalidFeedback = errors.New("invalid photo feedback")
+	// ErrFeedbackRecorderUnavailable reports that feedback cannot be persisted.
+	ErrFeedbackRecorderUnavailable = errors.New("feedback recorder unavailable")
 )
 
 // Service selects catalog photos and records successful selections in memory.
@@ -108,6 +114,38 @@ func (s *Service) History() []HistoryEntry {
 	return history
 }
 
+// RecordFeedback persists feedback for the newest recent selection matching relativePath.
+func (s *Service) RecordFeedback(relativePath string, feedback Feedback) error {
+	feedback, err := validateFeedback(feedback)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, entry := range s.history {
+		if entry.Photo.Path != relativePath {
+			continue
+		}
+		if s.recorder == nil {
+			return ErrFeedbackRecorderUnavailable
+		}
+		event := FeedbackEvent{
+			Type:    feedback.Type,
+			Path:    entry.Photo.Path,
+			ShownAt: entry.ShownAt,
+			Rating:  feedback.Rating,
+			Tag:     feedback.Tag,
+		}
+		if err := s.recorder.RecordFeedback(event); err != nil {
+			return fmt.Errorf("record photo feedback: %w", err)
+		}
+		return nil
+	}
+	return ErrPhotoNotInHistory
+}
+
 // OpenImage opens a photo only if a fresh discovery still includes its relative path.
 func (s *Service) OpenImage(ctx context.Context, relativePath string) (Image, error) {
 	if !fs.ValidPath(relativePath) || path.Clean(relativePath) != relativePath {
@@ -147,4 +185,25 @@ func clonePhoto(selected Photo) Photo {
 		}
 	}
 	return clone
+}
+
+func validateFeedback(feedback Feedback) (Feedback, error) {
+	switch feedback.Type {
+	case FeedbackReject:
+		if feedback.Rating != 0 || feedback.Tag != "" {
+			return Feedback{}, ErrInvalidFeedback
+		}
+	case FeedbackRating:
+		if feedback.Rating < 1 || feedback.Rating > 5 || feedback.Tag != "" {
+			return Feedback{}, ErrInvalidFeedback
+		}
+	case FeedbackFaultyTag:
+		feedback.Tag = strings.TrimSpace(feedback.Tag)
+		if feedback.Tag == "" || feedback.Rating != 0 {
+			return Feedback{}, ErrInvalidFeedback
+		}
+	default:
+		return Feedback{}, ErrInvalidFeedback
+	}
+	return feedback, nil
 }

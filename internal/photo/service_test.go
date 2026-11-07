@@ -17,8 +17,9 @@ type memorySource struct {
 }
 
 type memoryRecorder struct {
-	entries []HistoryEntry
-	err     error
+	entries  []HistoryEntry
+	feedback []FeedbackEvent
+	err      error
 }
 
 func (r *memoryRecorder) Record(entry HistoryEntry) error {
@@ -26,6 +27,14 @@ func (r *memoryRecorder) Record(entry HistoryEntry) error {
 		return r.err
 	}
 	r.entries = append(r.entries, entry)
+	return nil
+}
+
+func (r *memoryRecorder) RecordFeedback(event FeedbackEvent) error {
+	if r.err != nil {
+		return r.err
+	}
+	r.feedback = append(r.feedback, event)
 	return nil
 }
 
@@ -248,16 +257,138 @@ func TestServiceHistoryTimestamps(t *testing.T) {
 	})
 }
 
+func TestServiceRecordFeedbackUsesNewestRecentSelection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		recorder := &memoryRecorder{}
+		service := NewService(&memorySource{photos: []Photo{{Path: "same.jpg"}}}, recorder)
+		for range 2 {
+			if _, err := service.Next(context.Background(), ""); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Sleep(time.Second)
+		}
+		history := service.History()
+		if len(history) != 2 || history[0].ShownAt.Equal(history[1].ShownAt) {
+			t.Fatalf("history = %#v, want two distinct selections", history)
+		}
+
+		if err := service.RecordFeedback("same.jpg", Feedback{Type: FeedbackRating, Rating: 5}); err != nil {
+			t.Fatal(err)
+		}
+		if len(recorder.feedback) != 1 {
+			t.Fatalf("feedback events = %d, want one", len(recorder.feedback))
+		}
+		got := recorder.feedback[0]
+		if got.Type != FeedbackRating || got.Path != "same.jpg" || got.Rating != 5 || got.Tag != "" ||
+			!got.ShownAt.Equal(history[0].ShownAt) {
+			t.Fatalf("feedback event = %#v, want newest selection %#v", got, history[0])
+		}
+	})
+}
+
+func TestServiceRecordFeedbackValidation(t *testing.T) {
+	tests := []struct {
+		name     string
+		feedback Feedback
+	}{
+		{name: "unknown type", feedback: Feedback{Type: "unknown"}},
+		{name: "reject with rating", feedback: Feedback{Type: FeedbackReject, Rating: 1}},
+		{name: "rating below range", feedback: Feedback{Type: FeedbackRating, Rating: 0}},
+		{name: "rating above range", feedback: Feedback{Type: FeedbackRating, Rating: 6}},
+		{name: "rating with tag", feedback: Feedback{Type: FeedbackRating, Rating: 3, Tag: "bad"}},
+		{name: "empty faulty tag", feedback: Feedback{Type: FeedbackFaultyTag}},
+		{name: "whitespace faulty tag", feedback: Feedback{Type: FeedbackFaultyTag, Tag: "  \t "}},
+		{name: "faulty tag with rating", feedback: Feedback{Type: FeedbackFaultyTag, Rating: 2, Tag: "bad"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := &memoryRecorder{}
+			service := NewService(&memorySource{photos: []Photo{{Path: "photo.jpg"}}}, recorder)
+			if _, err := service.Next(context.Background(), ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.RecordFeedback("photo.jpg", tt.feedback); !errors.Is(err, ErrInvalidFeedback) {
+				t.Fatalf("RecordFeedback() error = %v, want ErrInvalidFeedback", err)
+			}
+			if len(recorder.feedback) != 0 {
+				t.Fatalf("feedback events = %d, want 0 for invalid feedback", len(recorder.feedback))
+			}
+		})
+	}
+}
+
+func TestServiceRecordFeedbackRequiresRecentPhotoAndRecorder(t *testing.T) {
+	service := NewService(&memorySource{photos: []Photo{{Path: "photo.jpg"}}}, nil)
+	if _, err := service.Next(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	feedback := Feedback{Type: FeedbackReject}
+	if err := service.RecordFeedback("other.jpg", feedback); !errors.Is(err, ErrPhotoNotInHistory) {
+		t.Fatalf("RecordFeedback() error = %v, want ErrPhotoNotInHistory", err)
+	}
+	if err := service.RecordFeedback("photo.jpg", feedback); !errors.Is(err, ErrFeedbackRecorderUnavailable) {
+		t.Fatalf("RecordFeedback() error = %v, want ErrFeedbackRecorderUnavailable", err)
+	}
+}
+
+func TestServiceRecordFeedbackRejectsEvictedSelection(t *testing.T) {
+	source := &memorySource{}
+	recorder := &memoryRecorder{}
+	service := NewService(source, recorder)
+	firstPath := ""
+	for index := range historyLimit + 1 {
+		path := strings.Repeat("x", index+1) + ".jpg"
+		source.photos = []Photo{{Path: path}}
+		if _, err := service.Next(context.Background(), ""); err != nil {
+			t.Fatal(err)
+		}
+		if index == 0 {
+			firstPath = path
+		}
+	}
+	if len(service.History()) != historyLimit {
+		t.Fatalf("history length = %d, want %d", len(service.History()), historyLimit)
+	}
+	if err := service.RecordFeedback(firstPath, Feedback{Type: FeedbackReject}); !errors.Is(err, ErrPhotoNotInHistory) {
+		t.Fatalf("RecordFeedback() error = %v for evicted path, want ErrPhotoNotInHistory", err)
+	}
+	if len(recorder.feedback) != 0 {
+		t.Fatalf("feedback events = %d, want 0 for evicted selection", len(recorder.feedback))
+	}
+}
+
+func TestServiceRecordFeedbackPropagatesRecorderFailure(t *testing.T) {
+	recordErr := errors.New("disk full")
+	recorder := &memoryRecorder{}
+	service := NewService(&memorySource{photos: []Photo{{Path: "photo.jpg"}}}, recorder)
+	if _, err := service.Next(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	recorder.err = recordErr
+	if err := service.RecordFeedback("photo.jpg", Feedback{Type: FeedbackFaultyTag, Tag: "incorrect"}); !errors.Is(err, recordErr) {
+		t.Fatalf("RecordFeedback() error = %v, want wrapped recorder error", err)
+	}
+	if len(recorder.feedback) != 0 {
+		t.Fatalf("feedback events = %d, want 0 after recorder failure", len(recorder.feedback))
+	}
+}
+
 func TestServiceConcurrentAccess(t *testing.T) {
 	photos := []Photo{{Path: "a.jpg"}, {Path: "b.jpg"}, {Path: "c.jpg"}}
-	service := NewService(&memorySource{photos: photos}, nil)
+	service := NewService(&memorySource{photos: photos}, &memoryRecorder{})
 	var workers sync.WaitGroup
 	for range 50 {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			if _, err := service.Next(context.Background(), ""); err != nil {
+			selected, err := service.Next(context.Background(), "")
+			if err != nil {
 				t.Errorf("Next() error = %v", err)
+				return
+			}
+			if err := service.RecordFeedback(selected.Path, Feedback{Type: FeedbackReject}); err != nil &&
+				!errors.Is(err, ErrPhotoNotInHistory) {
+				t.Errorf("RecordFeedback() error = %v", err)
 			}
 			_ = service.History()
 		}()

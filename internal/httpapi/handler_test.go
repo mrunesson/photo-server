@@ -1,7 +1,9 @@
 package httpapi_test
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"photo-server/internal/eventlog"
 	"photo-server/internal/filesystem"
 	"photo-server/internal/httpapi"
 	"photo-server/internal/photo"
@@ -260,9 +263,269 @@ func TestPhotoAPIEventLogFailureDoesNotRecordSelection(t *testing.T) {
 	}
 }
 
+func TestPhotoFeedbackAPIRecordsDurableEvents(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "events.jsonl")
+	recorder, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := recorder.Close(); err != nil {
+			t.Errorf("close event log: %v", err)
+		}
+	})
+	server := newServerWithRecorder(t, map[string][]byte{"photo.jpg": {0xff, 0xd8, 0xff, 0xd9}}, recorder)
+	client := server.Client()
+
+	nextResponse, err := client.Get(server.URL + "/api/photos/next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var selected photoResponse
+	if err := json.NewDecoder(nextResponse.Body).Decode(&selected); err != nil {
+		t.Fatal(err)
+	}
+	if err := nextResponse.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	baseURL := strings.TrimSuffix(selected.ImageURL, "/image")
+	requests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "reject", path: "/reject"},
+		{name: "rating", path: "/rating", body: `{"rating":4}`},
+		{name: "faulty tag", path: "/faulty-tag", body: `{"tag":"incorrect location"}`},
+	}
+	for _, tt := range requests {
+		t.Run(tt.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodPost, server.URL+baseURL+tt.path, strings.NewReader(tt.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.body != "" {
+				request.Header.Set("Content-Type", "application/json")
+			}
+			response, err := client.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = response.Body.Close() }()
+			if response.StatusCode != http.StatusNoContent {
+				t.Fatalf("feedback status = %d, want 204", response.StatusCode)
+			}
+		})
+	}
+
+	historyHTTPResponse, err := client.Get(server.URL + "/api/photos/history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var history historyResponse
+	if err := json.NewDecoder(historyHTTPResponse.Body).Decode(&history); err != nil {
+		t.Fatal(err)
+	}
+	if err := historyHTTPResponse.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var shownAt time.Time
+	if err := json.Unmarshal(history.Photos[0].ShownAt, &shownAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	events := readLoggedEvents(t, logPath)
+	wantTypes := []string{"", "reject", "rating", "faulty_tag"}
+	if len(events) != len(wantTypes) {
+		t.Fatalf("logged event count = %d, want %d", len(events), len(wantTypes))
+	}
+	for index, wantType := range wantTypes {
+		if events[index].Type != wantType || events[index].Path != selected.Path || !events[index].ShownAt.Equal(shownAt) {
+			t.Errorf("logged event %d = %#v, want type %q for latest selection", index, events[index], wantType)
+		}
+	}
+	if events[2].Rating != 4 || events[3].Tag != "incorrect location" {
+		t.Errorf("rating/tag events = %#v and %#v, want rating 4 and tag", events[2], events[3])
+	}
+}
+
+func TestPhotoFeedbackAPIRejectsInvalidRequests(t *testing.T) {
+	recorder := &countingRecorder{}
+	server := newServerWithRecorder(t, map[string][]byte{"photo.jpg": {0xff, 0xd8, 0xff, 0xd9}}, recorder)
+	client := server.Client()
+	selected := requestSelectedPhoto(t, server)
+	baseURL := strings.TrimSuffix(selected.ImageURL, "/image")
+	tests := []struct {
+		name       string
+		path       string
+		body       string
+		wantStatus int
+	}{
+		{name: "malformed JSON", path: "/rating", body: `{"rating":`, wantStatus: http.StatusBadRequest},
+		{name: "oversized JSON", path: "/rating", body: strings.Repeat(" ", 5000), wantStatus: http.StatusBadRequest},
+		{name: "missing rating", path: "/rating", body: `{}`, wantStatus: http.StatusBadRequest},
+		{name: "rating too low", path: "/rating", body: `{"rating":0}`, wantStatus: http.StatusBadRequest},
+		{name: "rating too high", path: "/rating", body: `{"rating":6}`, wantStatus: http.StatusBadRequest},
+		{name: "unknown rating field", path: "/rating", body: `{"rating":4,"extra":true}`, wantStatus: http.StatusBadRequest},
+		{name: "missing tag", path: "/faulty-tag", body: `{}`, wantStatus: http.StatusBadRequest},
+		{name: "empty tag", path: "/faulty-tag", body: `{"tag":"  "}`, wantStatus: http.StatusBadRequest},
+		{name: "reject body", path: "/reject", body: `{}`, wantStatus: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodPost, server.URL+baseURL+tt.path, strings.NewReader(tt.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := client.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = response.Body.Close() }()
+			if response.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", response.StatusCode, tt.wantStatus)
+			}
+		})
+	}
+	if len(recorder.feedback) != 0 {
+		t.Fatalf("feedback events = %d, want none for invalid requests", len(recorder.feedback))
+	}
+
+	invalidIDResponse, err := client.Post(server.URL+"/api/photos/not-base64/rating", "application/json", strings.NewReader(`{"rating":4}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = invalidIDResponse.Body.Close()
+	if invalidIDResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("invalid ID status = %d, want 404", invalidIDResponse.StatusCode)
+	}
+	unknownPhotoID := base64.RawURLEncoding.EncodeToString([]byte("not-shown.jpg"))
+	unknownResponse, err := client.Post(server.URL+"/api/photos/"+unknownPhotoID+"/reject", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unknownResponse.Body.Close()
+	if unknownResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown history path status = %d, want 404", unknownResponse.StatusCode)
+	}
+	if len(recorder.feedback) != 0 {
+		t.Fatalf("feedback events after invalid IDs = %d, want none", len(recorder.feedback))
+	}
+
+	wrongMethod, err := client.Get(server.URL + baseURL + "/reject")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = wrongMethod.Body.Close()
+	if wrongMethod.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status = %d, want 405", wrongMethod.StatusCode)
+	}
+	if !strings.Contains(wrongMethod.Header.Get("Allow"), http.MethodPost) {
+		t.Errorf("Allow = %q, want POST", wrongMethod.Header.Get("Allow"))
+	}
+}
+
+func TestPhotoFeedbackAPIReportsUnavailableRecorder(t *testing.T) {
+	server := newServer(t, map[string][]byte{"photo.jpg": {0xff, 0xd8, 0xff, 0xd9}})
+	selected := requestSelectedPhoto(t, server)
+	response, err := server.Client().Post(server.URL+strings.TrimSuffix(selected.ImageURL, "/image")+"/reject", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("feedback status = %d, want 503 without recorder", response.StatusCode)
+	}
+}
+
+func TestPhotoFeedbackAPIReportsRecorderFailure(t *testing.T) {
+	server := newServerWithRecorder(t, map[string][]byte{"photo.jpg": {0xff, 0xd8, 0xff, 0xd9}}, feedbackFailingRecorder{})
+	selected := requestSelectedPhoto(t, server)
+	response, err := server.Client().Post(server.URL+strings.TrimSuffix(selected.ImageURL, "/image")+"/reject", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("feedback status = %d, want 500 after recorder failure", response.StatusCode)
+	}
+}
+
+type loggedEvent struct {
+	Type    string    `json:"type"`
+	Path    string    `json:"path"`
+	ShownAt time.Time `json:"shown_at"`
+	Rating  int       `json:"rating,omitempty"`
+	Tag     string    `json:"tag,omitempty"`
+}
+
+func readLoggedEvents(t *testing.T, path string) []loggedEvent {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+	var events []loggedEvent
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var event loggedEvent
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			t.Fatalf("decode event %q: %v", scanner.Text(), err)
+		}
+		events = append(events, event)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+
+func requestSelectedPhoto(t *testing.T, server *httptest.Server) photoResponse {
+	t.Helper()
+	response, err := server.Client().Get(server.URL + "/api/photos/next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("next status = %d, want 200", response.StatusCode)
+	}
+	var selected photoResponse
+	if err := json.NewDecoder(response.Body).Decode(&selected); err != nil {
+		t.Fatal(err)
+	}
+	return selected
+}
+
+type countingRecorder struct {
+	feedback []photo.FeedbackEvent
+}
+
+func (countingRecorder) Record(photo.HistoryEntry) error { return nil }
+
+func (r *countingRecorder) RecordFeedback(event photo.FeedbackEvent) error {
+	r.feedback = append(r.feedback, event)
+	return nil
+}
+
+type feedbackFailingRecorder struct{}
+
+func (feedbackFailingRecorder) Record(photo.HistoryEntry) error { return nil }
+
+func (feedbackFailingRecorder) RecordFeedback(photo.FeedbackEvent) error {
+	return errors.New("feedback log unavailable")
+}
+
 type failingRecorder struct{}
 
 func (failingRecorder) Record(photo.HistoryEntry) error {
+	return errors.New("event log unavailable")
+}
+
+func (failingRecorder) RecordFeedback(photo.FeedbackEvent) error {
 	return errors.New("event log unavailable")
 }
 

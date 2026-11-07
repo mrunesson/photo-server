@@ -1,4 +1,4 @@
-// Package eventlog appends photo selection events as JSON Lines.
+// Package eventlog appends photo selection and feedback events as JSON Lines.
 package eventlog
 
 import (
@@ -57,7 +57,20 @@ func (l *Log) Record(entry photo.HistoryEntry) error {
 		return fmt.Errorf("encode photo selection event: %w", err)
 	}
 	encoded = append(encoded, '\n')
+	return l.appendEvent(encoded)
+}
 
+// RecordFeedback appends one feedback event as a newline-terminated JSON object.
+func (l *Log) RecordFeedback(event photo.FeedbackEvent) error {
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("encode photo feedback event: %w", err)
+	}
+	encoded = append(encoded, '\n')
+	return l.appendEvent(encoded)
+}
+
+func (l *Log) appendEvent(encoded []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {

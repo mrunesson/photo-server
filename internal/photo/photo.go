@@ -33,9 +33,35 @@ type HistoryEntry struct {
 	ShownAt time.Time
 }
 
-// EventRecorder persists successful photo selections.
+// FeedbackType identifies the kind of feedback recorded for a shown photo.
+type FeedbackType string
+
+const (
+	FeedbackReject    FeedbackType = "reject"
+	FeedbackRating    FeedbackType = "rating"
+	FeedbackFaultyTag FeedbackType = "faulty_tag"
+)
+
+// Feedback contains the values provided for a photo feedback event.
+type Feedback struct {
+	Type   FeedbackType
+	Rating int
+	Tag    string
+}
+
+// FeedbackEvent records feedback for a photo selection.
+type FeedbackEvent struct {
+	Type    FeedbackType `json:"type"`
+	Path    string       `json:"path"`
+	ShownAt time.Time    `json:"shown_at"`
+	Rating  int          `json:"rating,omitempty"`
+	Tag     string       `json:"tag,omitempty"`
+}
+
+// EventRecorder persists successful photo selections and feedback.
 type EventRecorder interface {
 	Record(HistoryEntry) error
+	RecordFeedback(FeedbackEvent) error
 }
 
 // Image provides a seekable photo file and the information needed for HTTP delivery.
