@@ -36,7 +36,9 @@ jobs:
           git diff --exit-code -- go.mod go.sum
 
       - name: Check formatting
-        run: test -z "$(gofmt -l .)"
+        run: |
+          gofmt_output="$(gofmt -l .)"
+          test -z "$gofmt_output"
 
       - name: Build
         run: go build ./...
