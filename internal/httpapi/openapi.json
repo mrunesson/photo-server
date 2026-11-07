@@ -1,0 +1,566 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Photo Server API",
+    "version": "1.0.0",
+    "description": "HTTP API for selecting photos, serving image bytes, reading recent selection history, and recording feedback. The service does not require authentication."
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "Current Photo Server host"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Photos",
+      "description": "Photo selection, image delivery, and recent history"
+    },
+    {
+      "name": "Feedback",
+      "description": "Feedback for photos selected within the recent history window"
+    },
+    {
+      "name": "Documentation",
+      "description": "Machine-readable API contract"
+    }
+  ],
+  "paths": {
+    "/docs/openapi.json": {
+      "get": {
+        "tags": ["Documentation"],
+        "summary": "Get the OpenAPI document",
+        "operationId": "getOpenAPIDocument",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.0 contract for this service.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "The HTTP method is not supported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": ["Documentation"],
+        "summary": "Check the OpenAPI document",
+        "operationId": "headOpenAPIDocument",
+        "responses": {
+          "200": {
+            "description": "The document headers, without a response body.",
+            "headers": {
+              "Content-Type": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "The HTTP method is not supported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/photos/next": {
+      "get": {
+        "tags": ["Photos"],
+        "summary": "Select the next photo",
+        "description": "Selects a random eligible photo and records the successful selection in the in-memory history and event log. When more than one eligible photo exists, the immediately previous selection is avoided. The response is not cacheable.",
+        "operationId": "getNextPhoto",
+        "parameters": [
+          {
+            "name": "album",
+            "in": "query",
+            "required": false,
+            "description": "Exact album path to select from; nested paths use slash separators. If omitted or empty, photos from all albums are eligible. Supplying this parameter more than once is invalid.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "trips/coast"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A selected photo and its image URL. Returns Cache-Control: no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "example": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PhotoResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "description": "No photo is available for the requested album, or a selected photo became unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/api/photos/history": {
+      "get": {
+        "tags": ["Photos"],
+        "summary": "Get recent photo selections",
+        "description": "Returns up to ten successful selections, newest first. History is held in memory and resets when the process restarts. Delivering an image does not add a history entry. The response is not cacheable.",
+        "operationId": "getPhotoHistory",
+        "responses": {
+          "200": {
+            "description": "Recent selections and when each was shown. Returns Cache-Control: no-store.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "example": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/photos/{id}/image": {
+      "get": {
+        "tags": ["Photos"],
+        "summary": "Get a photo image",
+        "description": "Streams the image for an opaque ID supplied in a photo response's image_url. Supports conditional and byte-range requests through standard HTTP content serving.",
+        "operationId": "getPhotoImage",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PhotoID"
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "description": "Optional byte range for partial image delivery.",
+            "schema": {
+              "type": "string",
+              "example": "bytes=0-1023"
+            }
+          },
+          {
+            "name": "If-Modified-Since",
+            "in": "header",
+            "required": false,
+            "description": "Return 304 when the image has not changed since this HTTP date.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The complete image. The Content-Type is selected from the image file extension when known, or detected from the content otherwise.",
+            "content": {
+              "image/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The requested byte range of the image.",
+            "headers": {
+              "Content-Range": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "image/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "The image has not changed since the conditional request date."
+          },
+          "404": {
+            "description": "The ID is invalid or the photo is no longer available.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "The requested byte range cannot be satisfied.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/api/photos/{id}/reject": {
+      "post": {
+        "tags": ["Feedback"],
+        "summary": "Reject a shown photo",
+        "description": "Records a rejection for the photo identified by an image_url. The ID must refer to one of the ten most recent successful selections; if a photo was selected more than once, feedback applies to its newest selection. The request must have an empty body.",
+        "operationId": "rejectPhoto",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PhotoID"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The feedback was recorded."
+          },
+          "400": {
+            "description": "The request body was not empty or the feedback was invalid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/PhotoNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/photos/{id}/rating": {
+      "post": {
+        "tags": ["Feedback"],
+        "summary": "Rate a shown photo",
+        "description": "Records a rating for a recently shown photo. Unknown JSON fields and extra JSON values are rejected; the request body is limited to 4096 bytes.",
+        "operationId": "ratePhoto",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PhotoID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "A rating from one to five.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RatingRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "The feedback was recorded."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/PhotoNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/photos/{id}/faulty-tag": {
+      "post": {
+        "tags": ["Feedback"],
+        "summary": "Report a faulty EXIF tag",
+        "description": "Reports an EXIF tag by name for a recently shown photo. The tag must contain non-whitespace text. Unknown JSON fields and extra JSON values are rejected; the request body is limited to 4096 bytes.",
+        "operationId": "reportFaultyTag",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PhotoID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "The EXIF tag name to report.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FaultyTagRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "The feedback was recorded."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/PhotoNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "PhotoID": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Opaque URL-safe ID provided in a photo response's image_url. Clients must not construct or decode it.",
+        "schema": {
+          "type": "string",
+          "maxLength": 5464
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "The request is malformed or contains invalid values.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "PhotoNotFound": {
+        "description": "The ID is invalid or does not refer to a photo in recent history.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "InternalServerError": {
+        "description": "An unexpected selection, delivery, or feedback persistence error occurred.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "No feedback recorder is configured, so feedback cannot be durably recorded.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "PhotoResponse": {
+        "type": "object",
+        "required": ["path", "metadata", "image_url"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Photo path relative to the configured photo root."
+          },
+          "album": {
+            "type": "string",
+            "description": "Album path when the photo belongs to an album; omitted for root-level photos."
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "image_url": {
+            "type": "string",
+            "description": "Stable image URL for this photo while it remains in the catalog."
+          }
+        }
+      },
+      "HistoryResponse": {
+        "type": "object",
+        "required": ["photos"],
+        "properties": {
+          "photos": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+              "$ref": "#/components/schemas/HistoryPhoto"
+            }
+          }
+        }
+      },
+      "HistoryPhoto": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/PhotoResponse"
+          },
+          {
+            "type": "object",
+            "required": ["shown_at"],
+            "properties": {
+              "shown_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "UTC timestamp for when this photo was selected."
+              }
+            }
+          }
+        ]
+      },
+      "Metadata": {
+        "type": "object",
+        "description": "Available EXIF metadata; fields are omitted when absent. captured_at is an EXIF local timestamp and may not include a timezone.",
+        "properties": {
+          "captured_at": {
+            "type": "string",
+            "description": "EXIF capture timestamp as recorded by the camera. It may have no timezone and is not necessarily UTC."
+          },
+          "coordinates": {
+            "$ref": "#/components/schemas/Coordinates"
+          },
+          "exif": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Available EXIF tags and their string values."
+          }
+        }
+      },
+      "Coordinates": {
+        "type": "object",
+        "required": ["latitude", "longitude"],
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "format": "double",
+            "minimum": -90,
+            "maximum": 90
+          },
+          "longitude": {
+            "type": "number",
+            "format": "double",
+            "minimum": -180,
+            "maximum": 180
+          }
+        }
+      },
+      "RatingRequest": {
+        "type": "object",
+        "required": ["rating"],
+        "additionalProperties": false,
+        "properties": {
+          "rating": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "Integer rating from one to five."
+          }
+        }
+      },
+      "FaultyTagRequest": {
+        "type": "object",
+        "required": ["tag"],
+        "additionalProperties": false,
+        "properties": {
+          "tag": {
+            "type": "string",
+            "minLength": 1,
+            "description": "EXIF tag name containing at least one non-whitespace character."
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

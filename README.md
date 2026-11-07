@@ -29,6 +29,8 @@ Use `landscapes` or `imagination` as the album name. See [demo/README.md](demo/R
 
 ## API
 
+The interactive OpenAPI UI is available at [`/docs/`](http://127.0.0.1:8080/docs/) when the service is running, and the OpenAPI 3 specification is available at [`/docs/openapi.json`](http://127.0.0.1:8080/docs/openapi.json). The UI and its assets are served locally. The canonical specification source is [`internal/httpapi/openapi.json`](internal/httpapi/openapi.json); update that document alongside HTTP handler changes so it stays aligned with the API behavior.
+
 ### `GET /api/photos/next`
 
 Returns a randomly selected photo from all albums. An optional `album` query parameter selects one exact album path, including nested paths such as `trips/coast`:

@@ -34,6 +34,260 @@ type historyResponse struct {
 	Photos []photoResponse `json:"photos"`
 }
 
+func TestOpenAPIDocument(t *testing.T) {
+	server := newServer(t, map[string][]byte{"photo.jpg": {0xff, 0xd8, 0xff, 0xd9}})
+	client := server.Client()
+
+	response, err := client.Get(server.URL + "/docs/openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("OpenAPI status = %d, want 200: %s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Fatalf("OpenAPI Content-Type = %q, want application/json; charset=utf-8", got)
+	}
+
+	var document struct {
+		OpenAPI string `json:"openapi"`
+		Info    struct {
+			Title   string `json:"title"`
+			Version string `json:"version"`
+		} `json:"info"`
+		Paths      map[string]map[string]json.RawMessage `json:"paths"`
+		Components struct {
+			Schemas map[string]json.RawMessage `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(body, &document); err != nil {
+		t.Fatalf("decode OpenAPI document: %v", err)
+	}
+	if document.OpenAPI != "3.0.3" || document.Info.Title == "" || document.Info.Version == "" {
+		t.Fatalf("OpenAPI metadata = (%q, %q, %q), want version 3.0.3 and non-empty title/version", document.OpenAPI, document.Info.Title, document.Info.Version)
+	}
+	if _, ok := document.Paths["/docs/openapi.json"]; !ok {
+		t.Error("OpenAPI paths missing /docs/openapi.json")
+	}
+	if _, ok := document.Paths["/openapi.json"]; ok {
+		t.Error("OpenAPI paths still include the old /openapi.json route")
+	}
+
+	operations := map[string]struct {
+		method    string
+		responses []string
+		bodyRef   string
+	}{
+		"/api/photos/next":            {method: "get", responses: []string{"200", "400", "404", "500"}},
+		"/api/photos/history":         {method: "get", responses: []string{"200"}},
+		"/api/photos/{id}/image":      {method: "get", responses: []string{"200", "206", "304", "404", "416", "500"}},
+		"/api/photos/{id}/reject":     {method: "post", responses: []string{"204", "400", "404", "500", "503"}},
+		"/api/photos/{id}/rating":     {method: "post", responses: []string{"204", "400", "404", "500", "503"}, bodyRef: "#/components/schemas/RatingRequest"},
+		"/api/photos/{id}/faulty-tag": {method: "post", responses: []string{"204", "400", "404", "500", "503"}, bodyRef: "#/components/schemas/FaultyTagRequest"},
+	}
+	for path, expected := range operations {
+		pathItem, ok := document.Paths[path]
+		if !ok {
+			t.Errorf("OpenAPI paths missing %s", path)
+			continue
+		}
+		var operation struct {
+			Responses   map[string]json.RawMessage `json:"responses"`
+			RequestBody *struct {
+				Content map[string]struct {
+					Schema struct {
+						Ref string `json:"$ref"`
+					} `json:"schema"`
+				} `json:"content"`
+			} `json:"requestBody"`
+		}
+		if raw, ok := pathItem[expected.method]; !ok {
+			t.Errorf("OpenAPI %s %s operation missing", strings.ToUpper(expected.method), path)
+			continue
+		} else if err := json.Unmarshal(raw, &operation); err != nil {
+			t.Errorf("decode OpenAPI %s %s operation: %v", strings.ToUpper(expected.method), path, err)
+			continue
+		}
+		for _, status := range expected.responses {
+			if _, ok := operation.Responses[status]; !ok {
+				t.Errorf("OpenAPI %s %s response %s missing", strings.ToUpper(expected.method), path, status)
+			}
+		}
+		if expected.bodyRef != "" {
+			if operation.RequestBody == nil {
+				t.Errorf("OpenAPI %s %s request body missing", strings.ToUpper(expected.method), path)
+				continue
+			}
+			content, ok := operation.RequestBody.Content["application/json"]
+			if !ok || content.Schema.Ref != expected.bodyRef {
+				t.Errorf("OpenAPI %s %s JSON request schema = %q, want %q", strings.ToUpper(expected.method), path, content.Schema.Ref, expected.bodyRef)
+			}
+		}
+	}
+
+	type schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	decodeSchema := func(name string) schema {
+		t.Helper()
+		var value schema
+		if raw, ok := document.Components.Schemas[name]; !ok {
+			t.Errorf("OpenAPI component schema %q missing", name)
+		} else if err := json.Unmarshal(raw, &value); err != nil {
+			t.Errorf("decode OpenAPI schema %q: %v", name, err)
+		}
+		return value
+	}
+	rating := decodeSchema("RatingRequest")
+	if len(rating.Required) != 1 || rating.Required[0] != "rating" {
+		t.Errorf("rating required fields = %v, want [rating]", rating.Required)
+	}
+	var ratingField struct {
+		Type    string `json:"type"`
+		Minimum int    `json:"minimum"`
+		Maximum int    `json:"maximum"`
+	}
+	if err := json.Unmarshal(rating.Properties["rating"], &ratingField); err != nil || ratingField.Type != "integer" || ratingField.Minimum != 1 || ratingField.Maximum != 5 {
+		t.Errorf("rating schema = %#v (decode error %v), want integer from 1 to 5", ratingField, err)
+	}
+	faultyTag := decodeSchema("FaultyTagRequest")
+	if len(faultyTag.Required) != 1 || faultyTag.Required[0] != "tag" {
+		t.Errorf("faulty-tag required fields = %v, want [tag]", faultyTag.Required)
+	}
+	metadata := decodeSchema("Metadata")
+	var capturedAt struct {
+		Type   string `json:"type"`
+		Format string `json:"format"`
+	}
+	if err := json.Unmarshal(metadata.Properties["captured_at"], &capturedAt); err != nil || capturedAt.Type != "string" || capturedAt.Format != "" {
+		t.Errorf("captured_at schema = %#v (decode error %v), want a string without a date-time format", capturedAt, err)
+	}
+	for _, name := range []string{"PhotoResponse", "HistoryResponse", "HistoryPhoto", "Coordinates", "ErrorResponse"} {
+		decodeSchema(name)
+	}
+
+	headResponse, err := client.Head(server.URL + "/docs/openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := headResponse.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if headResponse.StatusCode != http.StatusOK || headResponse.Header.Get("Content-Type") != "application/json; charset=utf-8" {
+		t.Errorf("OpenAPI HEAD response = (%d, %q), want (200, application/json; charset=utf-8)", headResponse.StatusCode, headResponse.Header.Get("Content-Type"))
+	}
+
+	unsupportedResponse, err := client.Post(server.URL+"/docs/openapi.json", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unsupportedResponse.Body.Close()
+	if unsupportedResponse.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("OpenAPI POST status = %d, want 405", unsupportedResponse.StatusCode)
+	}
+	if got := unsupportedResponse.Header.Get("Allow"); got != "GET, HEAD" {
+		t.Errorf("OpenAPI POST Allow = %q, want GET, HEAD", got)
+	}
+
+	oldEndpoint, err := client.Get(server.URL + "/openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = oldEndpoint.Body.Close()
+	if oldEndpoint.StatusCode != http.StatusNotFound {
+		t.Errorf("old OpenAPI endpoint status = %d, want 404", oldEndpoint.StatusCode)
+	}
+}
+
+func TestDocsUI(t *testing.T) {
+	server := newServer(t, map[string][]byte{"photo.jpg": {0xff, 0xd8, 0xff, 0xd9}})
+	client := server.Client()
+
+	redirectClient := *client
+	redirectClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	redirect, err := redirectClient.Get(server.URL + "/docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = redirect.Body.Close()
+	if redirect.StatusCode != http.StatusMovedPermanently || redirect.Header.Get("Location") != "/docs/" {
+		t.Fatalf("/docs response = (%d, %q), want redirect to /docs/", redirect.StatusCode, redirect.Header.Get("Location"))
+	}
+
+	response, err := client.Get(server.URL + "/docs/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(response.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("docs UI response = (%d, %q), want HTML 200", response.StatusCode, response.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(string(page), "/docs/openapi.json") {
+		t.Errorf("docs UI page does not configure /docs/openapi.json")
+	}
+	if strings.Contains(string(page), "cdn.jsdelivr.net") || strings.Contains(string(page), "unpkg.com") {
+		t.Error("docs UI page references external CDN assets")
+	}
+
+	headResponse, err := client.Head(server.URL + "/docs/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	headBody, readErr := io.ReadAll(headResponse.Body)
+	_ = headResponse.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if headResponse.StatusCode != http.StatusOK || len(headBody) != 0 {
+		t.Errorf("docs UI HEAD response = (%d, %d bytes), want 200 with no body", headResponse.StatusCode, len(headBody))
+	}
+
+	for _, asset := range []string{"swagger-ui.css", "swagger-ui-bundle.js"} {
+		assetResponse, err := client.Get(server.URL + "/docs/" + asset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assetBody, readErr := io.ReadAll(assetResponse.Body)
+		_ = assetResponse.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if assetResponse.StatusCode != http.StatusOK || len(assetBody) == 0 {
+			t.Errorf("docs asset %s response = (%d, %d bytes), want non-empty 200", asset, assetResponse.StatusCode, len(assetBody))
+		}
+	}
+
+	missing, err := client.Get(server.URL + "/docs/not-a-real-asset.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = missing.Body.Close()
+	if missing.StatusCode != http.StatusNotFound {
+		t.Errorf("missing docs asset status = %d, want 404", missing.StatusCode)
+	}
+
+	unsupported, err := client.Post(server.URL+"/docs/", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unsupported.Body.Close()
+	if unsupported.StatusCode != http.StatusMethodNotAllowed || unsupported.Header.Get("Allow") != "GET, HEAD" {
+		t.Errorf("docs UI POST response = (%d, %q), want 405 and Allow GET, HEAD", unsupported.StatusCode, unsupported.Header.Get("Allow"))
+	}
+}
+
 func TestPhotoAPI(t *testing.T) {
 	images := map[string][]byte{
 		"cover.jpg":           {0xff, 0xd8, 0xff, 0xd9, 0x01},
