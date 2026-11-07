@@ -184,7 +184,7 @@ func (c *Catalog) readMetadata(ctx context.Context, relativePath string) photo.M
 	if err != nil {
 		return photo.Metadata{}
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	decoded, decodeErr := exif.Decode(file)
 	if decoded == nil || (decodeErr != nil && exif.IsCriticalError(decodeErr)) {

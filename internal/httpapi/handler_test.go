@@ -105,7 +105,7 @@ func TestPhotoAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer historyHTTPResponse.Body.Close()
+	defer func() { _ = historyHTTPResponse.Body.Close() }()
 	if historyHTTPResponse.StatusCode != http.StatusOK {
 		t.Fatalf("history status = %d, want 200", historyHTTPResponse.StatusCode)
 	}
@@ -140,7 +140,7 @@ func TestPhotoAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rereadResponse.Body.Close()
+	defer func() { _ = rereadResponse.Body.Close() }()
 	var reread historyResponse
 	if err := json.NewDecoder(rereadResponse.Body).Decode(&reread); err != nil {
 		t.Fatal(err)
@@ -178,7 +178,7 @@ func TestPhotoAPIErrorsAndMethods(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer response.Body.Close()
+			defer func() { _ = response.Body.Close() }()
 			if response.StatusCode != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", response.StatusCode, tt.wantStatus)
 			}
@@ -195,7 +195,7 @@ func TestPhotoAPIEmptyCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", response.StatusCode)
 	}
@@ -221,7 +221,7 @@ func TestPhotoAPIDisappearedSelectionIsNotRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer historyHTTPResponse.Body.Close()
+	defer func() { _ = historyHTTPResponse.Body.Close() }()
 	var history historyResponse
 	if err := json.NewDecoder(historyHTTPResponse.Body).Decode(&history); err != nil {
 		t.Fatal(err)
@@ -250,7 +250,7 @@ func TestPhotoAPIEventLogFailureDoesNotRecordSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer historyHTTPResponse.Body.Close()
+	defer func() { _ = historyHTTPResponse.Body.Close() }()
 	var history historyResponse
 	if err := json.NewDecoder(historyHTTPResponse.Body).Decode(&history); err != nil {
 		t.Fatal(err)
