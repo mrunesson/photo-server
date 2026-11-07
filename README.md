@@ -19,6 +19,23 @@ PHOTO_DIR=/path/to/photos HTTP_ADDR=0.0.0.0:8080 go run ./cmd/photo-server
 
 The default listen address is limited to the local machine. Use a reachable interface address when slideshow clients run on other devices, and keep the service on a trusted network because it has no authentication.
 
+## Building and containers
+
+Run `make build` to create binaries in `build/` for macOS arm64, Linux arm64, and Linux amd64. Individual targets are available as `make build-macos-arm64`, `make build-linux-arm64`, and `make build-linux-amd64`.
+
+Build architecture-specific Linux container images with `make container-images`. The default image names are `photo-server:linux-arm64` and `photo-server:linux-amd64`; set `IMAGE_NAME` to use another image name. The Makefile uses Apple's `container` CLI by default. To use Docker instead, run `make container-images CONTAINER_ENGINE=docker`.
+
+The container listens on port `8080`, reads photos from `/photos`, and writes its event log to `/data/events.jsonl`. Mount the photo directory read-only and provide a persistent writable volume for `/data`:
+
+```sh
+docker run --rm -p 8080:8080 \
+  -v /path/to/photos:/photos:ro \
+  -v photo-server-events:/data \
+  photo-server:linux-arm64
+```
+
+Use the `linux-amd64` tag for x86-64 hosts. The container defaults do not change the host defaults; set `PHOTO_DIR`, `EVENT_LOG`, or `HTTP_ADDR` to override them.
+
 To try the service with the included AI-generated demo albums, run:
 
 ```sh

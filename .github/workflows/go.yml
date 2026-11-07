@@ -40,8 +40,10 @@ jobs:
           gofmt_output="$(gofmt -l .)"
           test -z "$gofmt_output"
 
-      - name: Build
-        run: go build ./...
+      - name: Build binaries and container images
+        run: |
+          make build
+          make container-images CONTAINER_ENGINE=docker
 
       - name: Test with race detector
         run: go test -race -shuffle=on ./...
