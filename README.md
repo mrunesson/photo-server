@@ -78,6 +78,23 @@ Example response:
 
 The `path` is relative to `PHOTO_DIR`. The `image_url` is a stable URL for that path while the file remains in the catalog. A photo is not immediately repeated when another eligible photo is available. If no eligible photo exists, the endpoint responds with `404`.
 
+### `GET /api/photos/events`
+
+Opens a live Server-Sent Events stream. Connect before requesting the next photo to receive every successful selection made through `GET /api/photos/next`, including selections made by other clients:
+
+```sh
+curl -N 'http://127.0.0.1:8080/api/photos/events'
+```
+
+Each selection is sent as an event named `photo`; its `data` is a JSON photo response with the UTC `shown_at` timestamp:
+
+```text
+event: photo
+data: {"path":"trips/coast/photo.jpg","album":"trips/coast","metadata":{},"image_url":"/api/photos/dHJpcHMvY29hc3QvcGhvdG8uanBn/image","shown_at":"2026-11-07T15:02:00Z"}
+```
+
+The stream is live-only and does not replay events on reconnect; reconnect to receive future selections. A client that cannot keep up with the bounded event buffer is disconnected and should reconnect. Initial and periodic comment frames keep idle connections open. `HEAD` returns headers without opening a stream. Failed or unrecorded selections do not generate events.
+
 ### `GET /api/photos/{id}/image`
 
 Streams the selected image bytes. The `id` is opaque and is supplied in `image_url`; clients should not construct it. The endpoint returns `404` if the file has been removed or is no longer a supported catalog photo.

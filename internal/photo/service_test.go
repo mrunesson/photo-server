@@ -141,6 +141,136 @@ func TestServiceNextAvoidsImmediateRepeatAndAllowsSinglePhoto(t *testing.T) {
 	}
 }
 
+func TestServiceSubscribersReceiveSelectionsInOrder(t *testing.T) {
+	service := NewService(&memorySource{photos: []Photo{{Path: "only.jpg"}}}, nil)
+	first, unsubscribeFirst := service.Subscribe()
+	defer unsubscribeFirst()
+	second, unsubscribeSecond := service.Subscribe()
+	defer unsubscribeSecond()
+
+	want := make([]HistoryEntry, 3)
+	for index := range want {
+		if _, err := service.Next(context.Background(), ""); err != nil {
+			t.Fatal(err)
+		}
+		want[index] = service.History()[0]
+	}
+
+	for index, expected := range want {
+		for subscriberIndex, events := range []<-chan HistoryEntry{first, second} {
+			select {
+			case got, ok := <-events:
+				if !ok {
+					t.Fatalf("subscriber %d closed before event %d", subscriberIndex, index)
+				}
+				if got.Photo.Path != expected.Photo.Path || !got.ShownAt.Equal(expected.ShownAt) {
+					t.Errorf("subscriber %d event %d = %#v, want %#v", subscriberIndex, index, got, expected)
+				}
+			default:
+				t.Fatalf("subscriber %d has no event %d", subscriberIndex, index)
+			}
+		}
+	}
+}
+
+func TestServiceSubscriberMetadataIsIsolated(t *testing.T) {
+	service := NewService(&memorySource{photos: []Photo{{
+		Path: "only.jpg",
+		Metadata: Metadata{
+			Coordinates: &Coordinates{Latitude: 1, Longitude: 2},
+			EXIF:        map[string]string{"Make": "camera"},
+		},
+	}}}, nil)
+	first, unsubscribeFirst := service.Subscribe()
+	defer unsubscribeFirst()
+	second, unsubscribeSecond := service.Subscribe()
+	defer unsubscribeSecond()
+
+	if _, err := service.Next(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	firstEvent := <-first
+	firstEvent.Photo.Metadata.EXIF["Make"] = "changed"
+	firstEvent.Photo.Metadata.Coordinates.Latitude = 99
+
+	secondEvent := <-second
+	if got := secondEvent.Photo.Metadata.EXIF["Make"]; got != "camera" {
+		t.Errorf("second subscriber metadata = %q, want camera", got)
+	}
+	if got := secondEvent.Photo.Metadata.Coordinates.Latitude; got != 1 {
+		t.Errorf("second subscriber latitude = %v, want 1", got)
+	}
+	if got := service.History()[0].Photo.Metadata.EXIF["Make"]; got != "camera" {
+		t.Errorf("history metadata = %q after subscriber mutation, want camera", got)
+	}
+}
+
+func TestServiceFailedSelectionsAreNotPublished(t *testing.T) {
+	tests := []struct {
+		name     string
+		source   Source
+		recorder EventRecorder
+	}{
+		{
+			name:   "photo verification fails",
+			source: &memorySource{photos: []Photo{{Path: "only.jpg"}}, openErr: errors.New("removed")},
+		},
+		{
+			name:     "recording fails",
+			source:   &memorySource{photos: []Photo{{Path: "only.jpg"}}},
+			recorder: &memoryRecorder{err: errors.New("disk full")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service := NewService(tt.source, tt.recorder)
+			events, unsubscribe := service.Subscribe()
+			defer unsubscribe()
+
+			if _, err := service.Next(context.Background(), ""); err == nil {
+				t.Fatal("Next() error = nil, want failure")
+			}
+			select {
+			case event, ok := <-events:
+				if ok {
+					t.Fatalf("received event for failed selection: %#v", event)
+				}
+			default:
+			}
+		})
+	}
+}
+
+func TestServiceUnsubscribeAndSlowSubscriber(t *testing.T) {
+	service := NewService(&memorySource{photos: []Photo{{Path: "only.jpg"}}}, nil)
+	serviceEvents, unsubscribe := service.Subscribe()
+	unsubscribe()
+	if _, ok := <-serviceEvents; ok {
+		t.Fatal("unsubscribed channel remains open")
+	}
+
+	slowEvents, unsubscribeSlow := service.Subscribe()
+	defer unsubscribeSlow()
+	for range subscriberBufferSize + 1 {
+		if _, err := service.Next(context.Background(), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range subscriberBufferSize {
+		select {
+		case _, ok := <-slowEvents:
+			if !ok {
+				t.Fatal("slow subscriber closed before its buffer was drained")
+			}
+		default:
+			t.Fatal("slow subscriber is missing a queued event")
+		}
+	}
+	if _, ok := <-slowEvents; ok {
+		t.Fatal("slow subscriber channel remains open after falling behind")
+	}
+}
+
 func TestServiceFailedSelectionIsNotRecorded(t *testing.T) {
 	source := &memorySource{photos: []Photo{{Path: "a.jpg"}}, openErr: errors.New("removed")}
 	recorder := &memoryRecorder{}

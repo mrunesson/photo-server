@@ -20,6 +20,8 @@ import (
 
 const maxEncodedPhotoPath = 5464
 const maxFeedbackBodyBytes = 4096
+const sseKeepaliveInterval = 15 * time.Second
+const sseWriteTimeout = 10 * time.Second
 
 //go:embed openapi.json
 var openAPISpec []byte
@@ -66,6 +68,7 @@ func NewHandler(service *photo.Service, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /docs/openapi.json", h.openAPI)
 	mux.Handle("GET /docs/", swaggerui.New("Photo Server API", "/docs/openapi.json", "/docs/"))
 	mux.HandleFunc("GET /api/photos/next", h.next)
+	mux.HandleFunc("GET /api/photos/events", h.photoEvents)
 	mux.HandleFunc("GET /api/photos/history", h.history)
 	mux.HandleFunc("GET /api/photos/{id}/image", h.image)
 	mux.HandleFunc("POST /api/photos/{id}/reject", h.reject)
@@ -109,6 +112,78 @@ func (h *handler) next(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, makePhotoResponse(selected))
+}
+
+func (h *handler) photoEvents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	controller := http.NewResponseController(w)
+	if err := controller.SetWriteDeadline(time.Time{}); err != nil {
+		h.logger.Error("prepare photo event stream", "error", err)
+		writeError(w, http.StatusInternalServerError, "photo event stream unavailable")
+		return
+	}
+	events, unsubscribe := h.service.Subscribe()
+	defer unsubscribe()
+
+	w.WriteHeader(http.StatusOK)
+	if err := writeSSE(w, controller, []byte(": connected\n\n")); err != nil {
+		h.logger.Debug("write photo event stream", "error", err)
+		return
+	}
+
+	keepalive := time.NewTicker(sseKeepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case entry, ok := <-events:
+			if !ok {
+				return
+			}
+			payload, err := json.Marshal(historyPhotoResponse{
+				photoResponse: makePhotoResponse(entry.Photo),
+				ShownAt:       entry.ShownAt,
+			})
+			if err != nil {
+				h.logger.Error("encode photo event", "error", err)
+				return
+			}
+			frame := append([]byte("event: photo\ndata: "), payload...)
+			frame = append(frame, '\n', '\n')
+			if err := writeSSE(w, controller, frame); err != nil {
+				h.logger.Debug("write photo event stream", "error", err)
+				return
+			}
+		case <-keepalive.C:
+			if err := writeSSE(w, controller, []byte(": keepalive\n\n")); err != nil {
+				h.logger.Debug("write photo event stream keepalive", "error", err)
+				return
+			}
+		}
+	}
+}
+
+func writeSSE(w http.ResponseWriter, controller *http.ResponseController, frame []byte) error {
+	if err := controller.SetWriteDeadline(time.Now().Add(sseWriteTimeout)); err != nil {
+		return err
+	}
+	defer func() { _ = controller.SetWriteDeadline(time.Time{}) }()
+	written, err := w.Write(frame)
+	if err != nil {
+		return err
+	}
+	if written != len(frame) {
+		return io.ErrShortWrite
+	}
+	return controller.Flush()
 }
 
 func (h *handler) history(w http.ResponseWriter, _ *http.Request) {
@@ -229,6 +304,11 @@ func decodeFeedbackBody(w http.ResponseWriter, r *http.Request, value any) error
 
 func (h *handler) notFound(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/docs" || strings.HasPrefix(r.URL.Path, "/docs/") {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if r.URL.Path == "/api/photos/events" {
 		w.Header().Set("Allow", "GET, HEAD")
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return

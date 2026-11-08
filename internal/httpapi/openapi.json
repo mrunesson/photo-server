@@ -14,7 +14,7 @@
   "tags": [
     {
       "name": "Photos",
-      "description": "Photo selection, image delivery, and recent history"
+      "description": "Photo selection, image delivery, recent history, and live selection events"
     },
     {
       "name": "Feedback",
@@ -162,6 +162,40 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/photos/events": {
+      "get": {
+        "tags": ["Photos"],
+        "summary": "Subscribe to photo selection events",
+        "description": "Opens a live Server-Sent Events stream. Each successful GET /api/photos/next selection is sent to every connected subscriber as an event named photo with a JSON HistoryPhoto payload. The stream has no replay; reconnecting clients receive only future selections. A subscriber that falls behind the bounded server buffer is disconnected and should reconnect. Comment frames are sent on connect and periodically as keepalives. HEAD returns headers only.",
+        "operationId": "getPhotoEvents",
+        "responses": {
+          "200": {
+            "description": "A live event stream. Each photo event's data field is a JSON HistoryPhoto object.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "Server-Sent Events frames with event: photo and a JSON HistoryPhoto data payload."
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "The HTTP method is not supported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
           }
         }
       }

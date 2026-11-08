@@ -50,9 +50,12 @@ func run() (runErr error) {
 
 	service := photo.NewService(catalog, events)
 	handler := httpapi.NewHandler(service, logger)
+	serverContext, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
 	server := &http.Server{
 		Addr:              address,
 		Handler:           requestLogger(logger, handler),
+		BaseContext:       func(net.Listener) context.Context { return serverContext },
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      2 * time.Minute,
@@ -78,6 +81,7 @@ func run() (runErr error) {
 			return fmt.Errorf("serve HTTP: %w", err)
 		}
 	case <-ctx.Done():
+		cancelServer()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownContext); err != nil {
