@@ -127,7 +127,7 @@ The append-only log survives restarts; it is separate from the bounded in-memory
 
 ## Photos and metadata
 
-The service recognizes `.avif`, `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, and `.webp` files. It rescans the directory tree when selecting or serving a photo, so additions and removals become visible without restarting the process. Symbolic links are not cataloged, and image opens are confined to the configured photo root.
+The service recognizes `.avif`, `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, and `.webp` files. It caches the discovered catalog for one hour, so additions become visible on the next refresh; removed files are rejected immediately when opened. Symbolic links are not cataloged, and image opens are confined to the configured photo root.
 
 EXIF tags are returned when present and parseable. Capture time and GPS coordinates are optional; malformed or missing EXIF does not prevent an image from being served. EXIF timestamps usually do not contain a timezone, so `captured_at` is returned without an offset and must not be interpreted as UTC.
 
