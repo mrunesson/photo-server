@@ -86,6 +86,7 @@ func TestOpenAPIDocument(t *testing.T) {
 		bodyRef   string
 	}{
 		"/api/photos/next":            {method: "get", responses: []string{"200", "400", "404", "500"}},
+		"/api/photos/events":          {method: "get", responses: []string{"200", "405", "500"}},
 		"/api/photos/history":         {method: "get", responses: []string{"200"}},
 		"/api/photos/{id}/image":      {method: "get", responses: []string{"200", "206", "304", "404", "416", "500"}},
 		"/api/photos/{id}/reject":     {method: "post", responses: []string{"204", "400", "404", "500", "503"}},
@@ -205,6 +206,171 @@ func TestOpenAPIDocument(t *testing.T) {
 	if oldEndpoint.StatusCode != http.StatusNotFound {
 		t.Errorf("old OpenAPI endpoint status = %d, want 404", oldEndpoint.StatusCode)
 	}
+}
+
+func TestPhotoEventsAPIStreamsSuccessfulSelections(t *testing.T) {
+	server := newServer(t, map[string][]byte{"photo.jpg": {0xff, 0xd8, 0xff, 0xd9}})
+	firstResponse, firstEvents, cancelFirst := openPhotoEvents(t, server, 5*time.Second)
+	defer cancelFirst()
+	defer func() { _ = firstResponse.Body.Close() }()
+	secondResponse, secondEvents, cancelSecond := openPhotoEvents(t, server, 5*time.Second)
+	defer cancelSecond()
+	defer func() { _ = secondResponse.Body.Close() }()
+
+	for index := range 2 {
+		selected := requestSelectedPhoto(t, server)
+		for subscriberIndex, events := range []*bufio.Reader{firstEvents, secondEvents} {
+			got, err := readPhotoEvent(events)
+			if err != nil {
+				t.Fatalf("read subscriber %d event: %v", subscriberIndex, err)
+			}
+			if got.Path != selected.Path || got.ImageURL != selected.ImageURL || len(got.ShownAt) == 0 {
+				t.Errorf("subscriber %d event %d = %#v, want selection %#v with shown_at", subscriberIndex, index, got, selected)
+			}
+		}
+	}
+}
+
+func TestPhotoEventsAPIDoesNotPublishFailedSelections(t *testing.T) {
+	server := newServerWithRecorder(t, map[string][]byte{"photo.jpg": {0xff, 0xd8, 0xff, 0xd9}}, &firstSelectionFailingRecorder{})
+	streamResponse, events, cancel := openPhotoEvents(t, server, 5*time.Second)
+	defer cancel()
+	defer func() { _ = streamResponse.Body.Close() }()
+
+	response, err := server.Client().Get(server.URL + "/api/photos/next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("next status = %d, want 500 after event-log failure", response.StatusCode)
+	}
+
+	selected := requestSelectedPhoto(t, server)
+	historyHTTPResponse, err := server.Client().Get(server.URL + "/api/photos/history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = historyHTTPResponse.Body.Close() }()
+	var history historyResponse
+	if err := json.NewDecoder(historyHTTPResponse.Body).Decode(&history); err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Photos) != 1 {
+		t.Fatalf("history entries = %d, want one after successful selection", len(history.Photos))
+	}
+
+	got, err := readPhotoEvent(events)
+	if err != nil {
+		t.Fatalf("read successful selection event: %v", err)
+	}
+	var gotShownAt, wantShownAt time.Time
+	if err := json.Unmarshal(got.ShownAt, &gotShownAt); err != nil {
+		t.Fatalf("decode event shown_at: %v", err)
+	}
+	if err := json.Unmarshal(history.Photos[0].ShownAt, &wantShownAt); err != nil {
+		t.Fatalf("decode history shown_at: %v", err)
+	}
+	if got.Path != selected.Path || !gotShownAt.Equal(wantShownAt) {
+		t.Fatalf("stream event = %#v at %s, want successful selection %q at %s", got, gotShownAt, selected.Path, wantShownAt)
+	}
+}
+
+func TestPhotoEventsAPIHeadReturnsWithoutStreaming(t *testing.T) {
+	server := newServer(t, map[string][]byte{"photo.jpg": {0xff, 0xd8, 0xff, 0xd9}})
+	request, err := http.NewRequest(http.MethodHead, server.URL+"/api/photos/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), time.Second)
+	defer cancel()
+	request = request.WithContext(ctx)
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("HEAD response = (%d, %q), want 200 text/event-stream", response.StatusCode, response.Header.Get("Content-Type"))
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 0 {
+		t.Fatalf("HEAD body = %q, want empty", body)
+	}
+}
+
+func openPhotoEvents(t *testing.T, server *httptest.Server, timeout time.Duration) (*http.Response, *bufio.Reader, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/photos/events", nil)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	response, err := server.Client().Do(request)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		cancel()
+		_ = response.Body.Close()
+		t.Fatalf("events status = %d, want 200", response.StatusCode)
+	}
+	if got := response.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		cancel()
+		_ = response.Body.Close()
+		t.Fatalf("events Content-Type = %q, want text/event-stream", got)
+	}
+	reader := bufio.NewReader(response.Body)
+	comment, err := reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(comment) != ": connected" {
+		cancel()
+		_ = response.Body.Close()
+		t.Fatalf("initial stream comment = %q, error %v", comment, err)
+	}
+	blank, err := reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(blank) != "" {
+		cancel()
+		_ = response.Body.Close()
+		t.Fatalf("initial stream separator = %q, error %v", blank, err)
+	}
+	return response, reader, cancel
+}
+
+func readPhotoEvent(reader *bufio.Reader) (photoResponse, error) {
+	eventName := ""
+	data := ""
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return photoResponse{}, err
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			if eventName == "" {
+				continue
+			}
+			break
+		}
+		if strings.HasPrefix(line, "event: ") {
+			eventName = strings.TrimPrefix(line, "event: ")
+		}
+		if strings.HasPrefix(line, "data: ") {
+			data = strings.TrimPrefix(line, "data: ")
+		}
+	}
+	if eventName != "photo" {
+		return photoResponse{}, errors.New("unexpected server-sent event type: " + eventName)
+	}
+	var selected photoResponse
+	if err := json.Unmarshal([]byte(data), &selected); err != nil {
+		return photoResponse{}, err
+	}
+	return selected, nil
 }
 
 func TestDocsUI(t *testing.T) {
@@ -781,6 +947,22 @@ func (failingRecorder) Record(photo.HistoryEntry) error {
 
 func (failingRecorder) RecordFeedback(photo.FeedbackEvent) error {
 	return errors.New("event log unavailable")
+}
+
+type firstSelectionFailingRecorder struct {
+	failed bool
+}
+
+func (r *firstSelectionFailingRecorder) Record(photo.HistoryEntry) error {
+	if !r.failed {
+		r.failed = true
+		return errors.New("event log unavailable")
+	}
+	return nil
+}
+
+func (*firstSelectionFailingRecorder) RecordFeedback(photo.FeedbackEvent) error {
+	return nil
 }
 
 type disappearingSource struct{}

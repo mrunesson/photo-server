@@ -14,6 +14,7 @@ import (
 )
 
 const historyLimit = 10
+const subscriberBufferSize = 16
 
 var (
 	// ErrNoPhotos reports that the requested selection contains no available photos.
@@ -32,15 +33,44 @@ var (
 
 // Service selects catalog photos and records successful selections in memory.
 type Service struct {
-	source   Source
-	recorder EventRecorder
-	mu       sync.Mutex
-	history  []HistoryEntry
+	source           Source
+	recorder         EventRecorder
+	mu               sync.Mutex
+	history          []HistoryEntry
+	subscribers      map[uint64]chan HistoryEntry
+	nextSubscriberID uint64
 }
 
 // NewService creates a photo service backed by source and recorder. If recorder is nil, selections are recorded in memory only.
 func NewService(source Source, recorder EventRecorder) *Service {
 	return &Service{source: source, recorder: recorder}
+}
+
+// Subscribe registers a live selection subscriber. The returned cancellation function is safe to call more than once.
+// Subscribers that cannot keep up with the bounded event buffer are closed and removed.
+func (s *Service) Subscribe() (<-chan HistoryEntry, func()) {
+	s.mu.Lock()
+	if s.subscribers == nil {
+		s.subscribers = make(map[uint64]chan HistoryEntry)
+	}
+	id := s.nextSubscriberID
+	s.nextSubscriberID++
+	events := make(chan HistoryEntry, subscriberBufferSize)
+	s.subscribers[id] = events
+	s.mu.Unlock()
+
+	var once sync.Once
+	unsubscribe := func() {
+		once.Do(func() {
+			s.mu.Lock()
+			if events, ok := s.subscribers[id]; ok {
+				delete(s.subscribers, id)
+				close(events)
+			}
+			s.mu.Unlock()
+		})
+	}
+	return events, unsubscribe
 }
 
 // Next selects and verifies a photo, avoiding the previous photo when alternatives exist.
@@ -99,7 +129,19 @@ func (s *Service) Next(ctx context.Context, album string) (Photo, error) {
 	if len(s.history) > historyLimit {
 		s.history = s.history[:historyLimit]
 	}
+	s.publish(entry)
 	return clonePhoto(selected), nil
+}
+
+func (s *Service) publish(entry HistoryEntry) {
+	for id, events := range s.subscribers {
+		select {
+		case events <- HistoryEntry{Photo: clonePhoto(entry.Photo), ShownAt: entry.ShownAt}:
+		default:
+			close(events)
+			delete(s.subscribers, id)
+		}
+	}
 }
 
 // History returns up to ten successful selections, newest first.
