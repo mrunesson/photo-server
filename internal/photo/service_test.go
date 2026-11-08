@@ -16,6 +16,23 @@ type memorySource struct {
 	openErr error
 }
 
+type cacheTestSource struct {
+	mu            sync.Mutex
+	photos        []Photo
+	listErr       error
+	listCalls     int
+	listStarted   chan struct{}
+	listGate      <-chan struct{}
+	openCalls     int
+	failFirstOpen bool
+}
+
+type notifyingContext struct {
+	context.Context
+	doneCalled chan struct{}
+	once       sync.Once
+}
+
 type memoryRecorder struct {
 	entries  []HistoryEntry
 	feedback []FeedbackEvent
@@ -52,6 +69,90 @@ func (s *memorySource) Open(_ context.Context, relativePath string) (Image, erro
 		}
 	}
 	return Image{}, ErrPhotoNotFound
+}
+
+func (s *cacheTestSource) List(ctx context.Context) ([]Photo, error) {
+	s.mu.Lock()
+	s.listCalls++
+	if s.listStarted != nil {
+		select {
+		case s.listStarted <- struct{}{}:
+		default:
+		}
+	}
+	photos := append([]Photo(nil), s.photos...)
+	err := s.listErr
+	gate := s.listGate
+	s.mu.Unlock()
+
+	if gate != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-gate:
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return photos, nil
+}
+
+func (s *cacheTestSource) Open(_ context.Context, relativePath string) (Image, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.openCalls++
+	if s.failFirstOpen {
+		s.failFirstOpen = false
+		for index, photo := range s.photos {
+			if photo.Path == relativePath {
+				s.photos = append(s.photos[:index], s.photos[index+1:]...)
+				break
+			}
+		}
+		return Image{}, ErrPhotoNotFound
+	}
+	for _, photo := range s.photos {
+		if photo.Path == relativePath {
+			return Image{Content: nopReadSeekCloser{}}, nil
+		}
+	}
+	return Image{}, ErrPhotoNotFound
+}
+
+func (s *cacheTestSource) setPhotos(photos []Photo) {
+	s.mu.Lock()
+	s.photos = append([]Photo(nil), photos...)
+	s.mu.Unlock()
+}
+
+func (s *cacheTestSource) setListErr(err error) {
+	s.mu.Lock()
+	s.listErr = err
+	s.mu.Unlock()
+}
+
+func (s *cacheTestSource) setListGate(gate <-chan struct{}) {
+	s.mu.Lock()
+	s.listGate = gate
+	s.mu.Unlock()
+}
+
+func (s *cacheTestSource) listCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
+}
+
+func (s *cacheTestSource) openCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openCalls
+}
+
+func (c *notifyingContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.doneCalled) })
+	return c.Context.Done()
 }
 
 type nopReadSeekCloser struct{}
@@ -115,6 +216,193 @@ func TestServiceNext(t *testing.T) {
 				t.Fatalf("Next() selected unexpected path %q", got.Path)
 			}
 		})
+	}
+}
+
+func TestServiceCatalogCacheExpiresAfterOneHour(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := &cacheTestSource{photos: []Photo{{Path: "old.jpg"}}}
+		service := NewService(source, nil)
+
+		if got, err := service.Next(context.Background(), ""); err != nil || got.Path != "old.jpg" {
+			t.Fatalf("first Next() = (%q, %v), want old.jpg", got.Path, err)
+		}
+		source.setPhotos([]Photo{{Path: "old.jpg"}, {Path: "new.jpg"}})
+
+		if got, err := service.Next(context.Background(), ""); err != nil || got.Path != "old.jpg" {
+			t.Fatalf("cached Next() = (%q, %v), want old.jpg", got.Path, err)
+		}
+		if _, err := service.OpenImage(context.Background(), "new.jpg"); !errors.Is(err, ErrPhotoNotFound) {
+			t.Fatalf("OpenImage() for uncached addition error = %v, want ErrPhotoNotFound", err)
+		}
+		if got := source.listCallCount(); got != 1 {
+			t.Fatalf("List() calls before expiration = %d, want 1", got)
+		}
+
+		source.setPhotos([]Photo{{Path: "new.jpg"}})
+		synctest.Sleep(time.Hour)
+		if got, err := service.Next(context.Background(), ""); err != nil || got.Path != "new.jpg" {
+			t.Fatalf("Next() at expiration = (%q, %v), want new.jpg", got.Path, err)
+		}
+		if got := source.listCallCount(); got != 2 {
+			t.Fatalf("List() calls after expiration = %d, want 2", got)
+		}
+	})
+}
+
+func TestServiceCatalogCacheStoresEmptyResults(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := &cacheTestSource{}
+		service := NewService(source, nil)
+		if _, err := service.Next(context.Background(), ""); !errors.Is(err, ErrNoPhotos) {
+			t.Fatalf("first Next() error = %v, want ErrNoPhotos", err)
+		}
+		source.setPhotos([]Photo{{Path: "added.jpg"}})
+		if _, err := service.Next(context.Background(), ""); !errors.Is(err, ErrNoPhotos) {
+			t.Fatalf("cached empty Next() error = %v, want ErrNoPhotos", err)
+		}
+		if got := source.listCallCount(); got != 1 {
+			t.Fatalf("List() calls before expiration = %d, want 1", got)
+		}
+
+		synctest.Sleep(time.Hour)
+		if got, err := service.Next(context.Background(), ""); err != nil || got.Path != "added.jpg" {
+			t.Fatalf("Next() after expiration = (%q, %v), want added.jpg", got.Path, err)
+		}
+		if got := source.listCallCount(); got != 2 {
+			t.Fatalf("List() calls after expiration = %d, want 2", got)
+		}
+	})
+}
+
+func TestServiceCatalogListFailureCanBeRetried(t *testing.T) {
+	listErr := errors.New("catalog unavailable")
+	source := &cacheTestSource{photos: []Photo{{Path: "photo.jpg"}}, listErr: listErr}
+	service := NewService(source, nil)
+	if _, err := service.Next(context.Background(), ""); !errors.Is(err, listErr) {
+		t.Fatalf("Next() error = %v, want wrapped catalog error", err)
+	}
+	source.setListErr(nil)
+	if got, err := service.Next(context.Background(), ""); err != nil || got.Path != "photo.jpg" {
+		t.Fatalf("retry Next() = (%q, %v), want photo.jpg", got.Path, err)
+	}
+	if got := source.listCallCount(); got != 2 {
+		t.Fatalf("List() calls = %d, want 2 after retry", got)
+	}
+}
+
+func TestServiceCatalogCacheCopiesMetadata(t *testing.T) {
+	source := &cacheTestSource{photos: []Photo{{
+		Path: "photo.jpg",
+		Metadata: Metadata{
+			Coordinates: &Coordinates{Latitude: 1, Longitude: 2},
+			EXIF:        map[string]string{"Make": "camera"},
+		},
+	}}}
+	service := NewService(source, nil)
+	first, err := service.Next(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Metadata.Coordinates.Latitude = 99
+	first.Metadata.EXIF["Make"] = "changed"
+
+	second, err := service.Next(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Metadata.Coordinates.Latitude != 1 || second.Metadata.EXIF["Make"] != "camera" {
+		t.Fatalf("cached metadata after caller mutation = %#v, want original metadata", second.Metadata)
+	}
+	if got := source.listCallCount(); got != 1 {
+		t.Fatalf("List() calls = %d, want 1", got)
+	}
+}
+
+func TestServiceCatalogCacheSingleFlightAndCanceledWaiter(t *testing.T) {
+	gate := make(chan struct{})
+	source := &cacheTestSource{
+		photos:      []Photo{{Path: "photo.jpg"}},
+		listStarted: make(chan struct{}, 1),
+		listGate:    gate,
+	}
+	service := NewService(source, nil)
+
+	ownerResult := make(chan error, 1)
+	go func() {
+		_, err := service.Next(context.Background(), "")
+		ownerResult <- err
+	}()
+	<-source.listStarted
+
+	waiterBase, cancelWaiter := context.WithCancel(context.Background())
+	waiterContext := &notifyingContext{Context: waiterBase, doneCalled: make(chan struct{})}
+	waiterResult := make(chan error, 1)
+	go func() {
+		_, err := service.Next(waiterContext, "")
+		waiterResult <- err
+	}()
+	<-waiterContext.doneCalled
+	cancelWaiter()
+	if err := <-waiterResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter Next() error = %v, want context.Canceled", err)
+	}
+	close(gate)
+	if err := <-ownerResult; err != nil {
+		t.Fatalf("owner Next() error = %v", err)
+	}
+	if got := source.listCallCount(); got != 1 {
+		t.Fatalf("concurrent List() calls = %d, want 1", got)
+	}
+}
+
+func TestServiceCatalogCanceledLoadCanBeRetried(t *testing.T) {
+	gate := make(chan struct{})
+	source := &cacheTestSource{
+		photos:      []Photo{{Path: "photo.jpg"}},
+		listStarted: make(chan struct{}, 1),
+		listGate:    gate,
+	}
+	service := NewService(source, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := service.Next(ctx, "")
+		result <- err
+	}()
+	<-source.listStarted
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Next() error = %v, want context.Canceled", err)
+	}
+
+	source.setListGate(nil)
+	if got, err := service.Next(context.Background(), ""); err != nil || got.Path != "photo.jpg" {
+		t.Fatalf("retry Next() = (%q, %v), want photo.jpg", got.Path, err)
+	}
+	if got := source.listCallCount(); got != 2 {
+		t.Fatalf("List() calls = %d, want 2 after canceled load", got)
+	}
+}
+
+func TestServiceNextSkipsStaleCachedCandidates(t *testing.T) {
+	source := &cacheTestSource{
+		photos:        []Photo{{Path: "a.jpg"}, {Path: "b.jpg"}},
+		failFirstOpen: true,
+	}
+	service := NewService(source, nil)
+	selected, err := service.Next(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Next() error = %v, want selection from remaining candidate", err)
+	}
+	if selected.Path != "a.jpg" && selected.Path != "b.jpg" {
+		t.Fatalf("Next() path = %q, want listed candidate", selected.Path)
+	}
+	if got := source.openCallCount(); got != 2 {
+		t.Fatalf("Open() calls = %d, want stale candidate retry", got)
+	}
+	if got := len(service.History()); got != 1 {
+		t.Fatalf("history entries = %d, want only successful selection", got)
 	}
 }
 
@@ -462,18 +750,20 @@ func TestServiceRecordFeedbackRequiresRecentPhotoAndRecorder(t *testing.T) {
 }
 
 func TestServiceRecordFeedbackRejectsEvictedSelection(t *testing.T) {
-	source := &memorySource{}
+	photos := make([]Photo, historyLimit+1)
+	for index := range photos {
+		photos[index] = Photo{
+			Path:  strings.Repeat("x", index+1) + ".jpg",
+			Album: strings.Repeat("a", index+1),
+		}
+	}
+	source := &memorySource{photos: photos}
 	recorder := &memoryRecorder{}
 	service := NewService(source, recorder)
-	firstPath := ""
-	for index := range historyLimit + 1 {
-		path := strings.Repeat("x", index+1) + ".jpg"
-		source.photos = []Photo{{Path: path}}
-		if _, err := service.Next(context.Background(), ""); err != nil {
+	firstPath := photos[0].Path
+	for _, photo := range photos {
+		if _, err := service.Next(context.Background(), photo.Album); err != nil {
 			t.Fatal(err)
-		}
-		if index == 0 {
-			firstPath = path
 		}
 	}
 	if len(service.History()) != historyLimit {

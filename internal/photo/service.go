@@ -15,6 +15,7 @@ import (
 
 const historyLimit = 10
 const subscriberBufferSize = 16
+const catalogCacheTTL = time.Hour
 
 var (
 	// ErrNoPhotos reports that the requested selection contains no available photos.
@@ -35,10 +36,21 @@ var (
 type Service struct {
 	source           Source
 	recorder         EventRecorder
+	catalogMu        sync.Mutex
+	catalogPhotos    []Photo
+	catalogExpiresAt time.Time
+	catalogCached    bool
+	catalogFlight    *catalogFlight
 	mu               sync.Mutex
 	history          []HistoryEntry
 	subscribers      map[uint64]chan HistoryEntry
 	nextSubscriberID uint64
+}
+
+type catalogFlight struct {
+	done   chan struct{}
+	photos []Photo
+	err    error
 }
 
 // NewService creates a photo service backed by source and recorder. If recorder is nil, selections are recorded in memory only.
@@ -79,7 +91,7 @@ func (s *Service) Next(ctx context.Context, album string) (Photo, error) {
 		return Photo{}, ErrInvalidAlbum
 	}
 
-	photos, err := s.source.List(ctx)
+	photos, err := s.catalog(ctx)
 	if err != nil {
 		return Photo{}, fmt.Errorf("discover photos: %w", err)
 	}
@@ -97,12 +109,15 @@ func (s *Service) Next(ctx context.Context, album string) (Photo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var previous []Photo
 	if len(candidates) > 1 && len(s.history) > 0 {
-		previous := s.history[0].Photo.Path
+		previousPath := s.history[0].Photo.Path
 		withoutPrevious := make([]Photo, 0, len(candidates)-1)
 		for _, candidate := range candidates {
-			if candidate.Path != previous {
+			if candidate.Path != previousPath {
 				withoutPrevious = append(withoutPrevious, candidate)
+			} else {
+				previous = append(previous, candidate)
 			}
 		}
 		if len(withoutPrevious) > 0 {
@@ -110,13 +125,31 @@ func (s *Service) Next(ctx context.Context, album string) (Photo, error) {
 		}
 	}
 
-	selected := candidates[rand.IntN(len(candidates))]
-	image, err := s.source.Open(ctx, selected.Path)
-	if err != nil {
-		return Photo{}, fmt.Errorf("verify selected photo: %w", err)
+	var selected Photo
+	for len(candidates) > 0 || len(previous) > 0 {
+		if len(candidates) == 0 {
+			candidates, previous = previous, nil
+		}
+		index := rand.IntN(len(candidates))
+		candidate := candidates[index]
+		candidates[index] = candidates[len(candidates)-1]
+		candidates = candidates[:len(candidates)-1]
+
+		image, err := s.source.Open(ctx, candidate.Path)
+		if err != nil {
+			if errors.Is(err, ErrPhotoNotFound) {
+				continue
+			}
+			return Photo{}, fmt.Errorf("verify selected photo: %w", err)
+		}
+		if err := image.Content.Close(); err != nil {
+			return Photo{}, fmt.Errorf("close selected photo: %w", err)
+		}
+		selected = candidate
+		break
 	}
-	if err := image.Content.Close(); err != nil {
-		return Photo{}, fmt.Errorf("close selected photo: %w", err)
+	if selected.Path == "" {
+		return Photo{}, ErrNoPhotos
 	}
 
 	entry := HistoryEntry{Photo: clonePhoto(selected), ShownAt: time.Now().UTC()}
@@ -131,6 +164,63 @@ func (s *Service) Next(ctx context.Context, album string) (Photo, error) {
 	}
 	s.publish(entry)
 	return clonePhoto(selected), nil
+}
+
+func (s *Service) catalog(ctx context.Context) ([]Photo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	s.catalogMu.Lock()
+	if s.catalogCached && time.Now().Before(s.catalogExpiresAt) {
+		photos := clonePhotos(s.catalogPhotos)
+		s.catalogMu.Unlock()
+		return photos, nil
+	}
+	if flight := s.catalogFlight; flight != nil {
+		s.catalogMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-flight.done:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if flight.err != nil {
+				return nil, flight.err
+			}
+			return clonePhotos(flight.photos), nil
+		}
+	}
+
+	flight := &catalogFlight{done: make(chan struct{})}
+	s.catalogFlight = flight
+	s.catalogMu.Unlock()
+
+	photos, err := s.source.List(ctx)
+	if err == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		} else {
+			photos = clonePhotos(photos)
+		}
+	}
+
+	s.catalogMu.Lock()
+	if err == nil {
+		s.catalogPhotos = photos
+		s.catalogExpiresAt = time.Now().Add(catalogCacheTTL)
+		s.catalogCached = true
+	}
+	flight.photos = photos
+	flight.err = err
+	s.catalogFlight = nil
+	close(flight.done)
+	s.catalogMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return clonePhotos(photos), nil
 }
 
 func (s *Service) publish(entry HistoryEntry) {
@@ -188,13 +278,13 @@ func (s *Service) RecordFeedback(relativePath string, feedback Feedback) error {
 	return ErrPhotoNotInHistory
 }
 
-// OpenImage opens a photo only if a fresh discovery still includes its relative path.
+// OpenImage opens a photo only if the cached discovery includes its relative path.
 func (s *Service) OpenImage(ctx context.Context, relativePath string) (Image, error) {
 	if !fs.ValidPath(relativePath) || path.Clean(relativePath) != relativePath {
 		return Image{}, ErrPhotoNotFound
 	}
 
-	photos, err := s.source.List(ctx)
+	photos, err := s.catalog(ctx)
 	if err != nil {
 		return Image{}, fmt.Errorf("discover photos: %w", err)
 	}
@@ -212,6 +302,14 @@ func (s *Service) OpenImage(ctx context.Context, relativePath string) (Image, er
 		return Image{}, fmt.Errorf("open photo: %w", err)
 	}
 	return image, nil
+}
+
+func clonePhotos(photos []Photo) []Photo {
+	clones := make([]Photo, len(photos))
+	for index, photo := range photos {
+		clones[index] = clonePhoto(photo)
+	}
+	return clones
 }
 
 func clonePhoto(selected Photo) Photo {
