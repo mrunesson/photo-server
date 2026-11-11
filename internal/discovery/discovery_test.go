@@ -94,6 +94,7 @@ func TestStartUsesListenerPortAndStopsAdvertisement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	//nolint:errcheck // best-effort cleanup in deferred close
 	defer listener.Close()
 
 	iface := net.Interface{Index: 1, Name: "en0", Flags: net.FlagUp | net.FlagMulticast}
@@ -137,6 +138,7 @@ func TestStartDoesNotAdvertiseLoopbackListener(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	//nolint:errcheck // best-effort cleanup in deferred close
 	defer listener.Close()
 
 	called := false
@@ -161,7 +163,8 @@ func TestStartReturnsRegistrationError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	//nolint:errcheck // best-effort cleanup in deferred close
+	defer func() { listener.Close() }()
 
 	wantErr := errors.New("registration failed")
 	stop, advertised, err := start(listener, []interfaceAddress{{
@@ -183,7 +186,8 @@ func TestStartFailsWhenMulticastIsBlockedEverywhere(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	//nolint:errcheck // best-effort cleanup in deferred close
+	defer func() { listener.Close() }()
 
 	blocked := &net.OpError{Op: "write", Net: "udp", Err: syscall.EHOSTUNREACH}
 	registered := false
@@ -219,7 +223,8 @@ func TestStartAdvertisesOnlyInterfacesWithWorkingMulticast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	//nolint:errcheck // best-effort cleanup in deferred close
+	defer func() { listener.Close() }()
 
 	working := net.Interface{Index: 2, Name: "en1", Flags: net.FlagUp | net.FlagMulticast}
 	var gotIPs []string

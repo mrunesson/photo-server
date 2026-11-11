@@ -165,6 +165,7 @@ func sendMulticastIPv4(iface net.Interface, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	//nolint:errcheck // best-effort cleanup in deferred close
 	defer conn.Close()
 	packetConn := ipv4.NewPacketConn(conn)
 	if err := packetConn.SetMulticastInterface(&iface); err != nil {
@@ -179,6 +180,7 @@ func sendMulticastIPv6(iface net.Interface, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	//nolint:errcheck // best-effort cleanup in deferred close
 	defer conn.Close()
 	packetConn := ipv6.NewPacketConn(conn)
 	if err := packetConn.SetMulticastInterface(&iface); err != nil {
