@@ -19,6 +19,10 @@ PHOTO_DIR=/path/to/photos HTTP_ADDR=0.0.0.0:8080 go run ./cmd/photo-server
 
 The default listen address is limited to the local machine. Use a reachable interface address when slideshow clients run on other devices, and keep the service on a trusted network because it has no authentication.
 
+When the listener is bound to a reachable network interface, Photo Server advertises a DNS-SD service named `Photo Server` as `_photo-server._tcp.local.`. The announcement uses the actual listening port, including when `HTTP_ADDR` requests an OS-assigned port. A wildcard listener advertises active, multicast-capable non-loopback interfaces; a listener bound to one address advertises only that address. Loopback-only listeners are not announced. The default `127.0.0.1:8080` listener therefore remains local-only; set `HTTP_ADDR` to a reachable interface address or `0.0.0.0:8080` for LAN clients.
+
+Before announcing, the server sends one mDNS probe per interface and only advertises on interfaces where multicast works. If no interface works, startup logs `zeroconf discovery unavailable` with the per-interface error and the HTTP server keeps running. On macOS, `sendmsg: no route to host` for `224.0.0.251` or `ff02::fb` means the process is denied Local Network access: the permission belongs to the application that launched the binary (Terminal, an IDE, a launchd job), so enable that application under System Settings > Privacy & Security > Local Network and restart the server. Verify the announcement with `dns-sd -B _photo-server._tcp local.`.
+
 ## Building and containers
 
 Run `make build` to create binaries in `build/` for macOS arm64, Linux arm64, and Linux amd64. Individual targets are available as `make build-macos-arm64`, `make build-linux-arm64`, and `make build-linux-amd64`.
@@ -35,6 +39,8 @@ docker run --rm -p 8080:8080 \
 ```
 
 Use the `linux-amd64` tag for x86-64 hosts. The container defaults do not change the host defaults; set `PHOTO_DIR`, `EVENT_LOG`, or `HTTP_ADDR` to override them.
+
+Container networking may block or isolate mDNS multicast even when the HTTP port is published. DNS-SD discovery is best-effort; clients may need to connect directly to the host address when multicast is unavailable.
 
 To try the service with the included AI-generated demo albums, run:
 
