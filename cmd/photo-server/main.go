@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"photo-server/internal/discovery"
 	"photo-server/internal/eventlog"
 	"photo-server/internal/filesystem"
 	"photo-server/internal/httpapi"
@@ -66,6 +67,15 @@ func run() (runErr error) {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", address, err)
 	}
+	stopDiscovery, advertised, err := discovery.Start(listener)
+	if err != nil {
+		logger.Warn("zeroconf discovery unavailable", "error", err)
+	} else if advertised {
+		defer stopDiscovery()
+		logger.Info("photo server announced via zeroconf", "service_type", discovery.ServiceType, "address", listener.Addr())
+	} else {
+		logger.Info("zeroconf announcement skipped", "reason", "no eligible multicast interface for listener")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -73,7 +83,7 @@ func run() (runErr error) {
 	go func() {
 		serveResult <- server.Serve(listener)
 	}()
-	logger.Info("photo server listening", "address", address, "photo_root", photoRoot, "event_log", eventLogPath)
+	logger.Info("photo server listening", "address", listener.Addr(), "photo_root", photoRoot, "event_log", eventLogPath)
 
 	select {
 	case err := <-serveResult:
